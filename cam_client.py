@@ -148,36 +148,127 @@ class AprilTagPoseEstimator:
         Returns:
             List of detected tag dictionaries
         """
+        # Update detection statistics
+        self.detection_stats['total_frames'] += 1
+        current_time = time.time()
+        
         # Convert to grayscale for AprilTag detection
         if len(frame.shape) == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
             gray = frame
         
-        # Detect tags
+        # Detect tags using robotpy_apriltag
+        start_time = time.time()
         detections = self.detector.detect(gray)
+        detection_time = time.time() - start_time
         
         detected_tags = []
+        rejected_tags = []
+        
         for detection in detections:
-            if detection.decision_margin < self.min_detection_confidence:
-                continue
-                
-            tag_id = detection.tag_id
-            if tag_id not in self.tag_positions:
-                continue  # Skip unknown tags
+            tag_id = detection.getId()
+            confidence = detection.getDecisionMargin()
             
-            # Extract corner coordinates
-            corners = detection.corners.astype(np.float32)
+            # Log detection attempt
+            if tag_id not in self.detection_stats['tag_detection_counts']:
+                self.detection_stats['tag_detection_counts'][tag_id] = {'seen': 0, 'accepted': 0, 'rejected': 0}
+            
+            self.detection_stats['tag_detection_counts'][tag_id]['seen'] += 1
+            
+            # Check confidence threshold
+            if confidence < self.min_detection_confidence:
+                rejected_tags.append({'id': tag_id, 'confidence': confidence, 'reason': 'low_confidence'})
+                self.detection_stats['tag_detection_counts'][tag_id]['rejected'] += 1
+                continue
+            
+            # Check if tag is in our configuration
+            if tag_id not in self.tag_positions:
+                rejected_tags.append({'id': tag_id, 'confidence': confidence, 'reason': 'unknown_id'})
+                print(f"⚠️  Detected unknown tag ID {tag_id} (confidence: {confidence:.3f}) - skipping")
+                continue
+            
+            # Extract corner coordinates from robotpy_apriltag detection
+            corners = np.array([
+                [detection.getCorner(0).x, detection.getCorner(0).y],
+                [detection.getCorner(1).x, detection.getCorner(1).y],
+                [detection.getCorner(2).x, detection.getCorner(2).y],
+                [detection.getCorner(3).x, detection.getCorner(3).y]
+            ], dtype=np.float32)
+            
+            # Calculate center point
+            center = detection.getCenter()
+            center_point = (center.x, center.y)
+            
+            # Calculate tag area and aspect ratio for quality assessment
+            tag_area = cv2.contourArea(corners)
+            x_min, x_max = np.min(corners[:, 0]), np.max(corners[:, 0])
+            y_min, y_max = np.min(corners[:, 1]), np.max(corners[:, 1])
+            width = x_max - x_min
+            height = y_max - y_min
+            aspect_ratio = width / height if height > 0 else 0
             
             detected_tags.append({
                 'id': tag_id,
                 'corners': corners,
-                'center': detection.center,
-                'confidence': detection.decision_margin,
-                'tag_info': self.tag_positions[tag_id]
+                'center': center_point,
+                'confidence': confidence,
+                'tag_info': self.tag_positions[tag_id],
+                'area': tag_area,
+                'width': width,
+                'height': height,
+                'aspect_ratio': aspect_ratio,
+                'detection_time': detection_time
             })
+            
+            self.detection_stats['tag_detection_counts'][tag_id]['accepted'] += 1
+        
+        # Update statistics
+        if detected_tags:
+            self.detection_stats['frames_with_tags'] += 1
+            self.detection_stats['total_tags_detected'] += len(detected_tags)
+            self.detection_stats['last_detection_time'] = current_time
+        
+        # Log detection summary periodically (every 60 frames to reduce spam)
+        if self.detection_stats['total_frames'] % 60 == 0:  # Every 60 frames
+            self._log_detection_status(detected_tags, rejected_tags, detection_time)
         
         return detected_tags
+    
+    def _log_detection_status(self, detected_tags, rejected_tags, detection_time):
+        """Log detailed detection status."""
+        stats = self.detection_stats
+        detection_rate = (stats['frames_with_tags'] / stats['total_frames']) * 100 if stats['total_frames'] > 0 else 0
+        
+        print(f"\n📊 APRILTAG DETECTION STATUS for Camera {self.camera_id}:")
+        print(f"   Frames processed: {stats['total_frames']}")
+        print(f"   Detection rate: {detection_rate:.1f}% ({stats['frames_with_tags']}/{stats['total_frames']})")
+        print(f"   Total tags detected: {stats['total_tags_detected']}")
+        print(f"   Detection time: {detection_time*1000:.1f}ms")
+        
+        if detected_tags:
+            print(f"   Current frame: {len(detected_tags)} tags detected")
+            for tag in detected_tags:
+                tag_id = tag['id']
+                pos = self.tag_positions[tag_id]['position']
+                print(f"      Tag {tag_id}: conf={tag['confidence']:.3f}, area={tag['area']:.0f}px², "
+                      f"aspect={tag['aspect_ratio']:.2f}, pos=({pos[0]}, {pos[1]})")
+        
+        if rejected_tags:
+            print(f"   Rejected tags: {len(rejected_tags)}")
+            for tag in rejected_tags:
+                print(f"      Tag {tag['id']}: conf={tag['confidence']:.3f}, reason={tag['reason']}")
+        
+        # Per-tag statistics
+        if stats['tag_detection_counts']:
+            print(f"   Tag detection history:")
+            for tag_id, counts in stats['tag_detection_counts'].items():
+                success_rate = (counts['accepted'] / counts['seen']) * 100 if counts['seen'] > 0 else 0
+                print(f"      Tag {tag_id}: {counts['accepted']}/{counts['seen']} ({success_rate:.1f}% success)")
+        else:
+            print(f"   No tags detected yet")
+        
+        print("=" * 50)
     
     def estimate_pose_from_frame(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
         """
@@ -278,6 +369,23 @@ class AprilTagPoseEstimator:
             print(f"AprilTag pose estimation error: {e}")
             return None
 
+    def get_detection_summary(self) -> Dict[str, Any]:
+        """Get summary of detection statistics."""
+        stats = self.detection_stats
+        detection_rate = (stats['frames_with_tags'] / stats['total_frames']) * 100 if stats['total_frames'] > 0 else 0
+        pose_success_rate = (stats['successful_poses'] / (stats['successful_poses'] + stats['failed_poses'])) * 100 if (stats['successful_poses'] + stats['failed_poses']) > 0 else 0
+        
+        return {
+            'total_frames': stats['total_frames'],
+            'detection_rate_percent': detection_rate,
+            'total_tags_detected': stats['total_tags_detected'],
+            'successful_poses': stats['successful_poses'],
+            'failed_poses': stats['failed_poses'],
+            'pose_success_rate_percent': pose_success_rate,
+            'tag_detection_counts': stats['tag_detection_counts'].copy(),
+            'last_detection_ago_seconds': time.time() - stats['last_detection_time'] if stats['last_detection_time'] > 0 else None
+        }
+
 
 class CameraClient:
     """Webcam object detection client with UDP transmission and AprilTag pose estimation."""
@@ -364,6 +472,11 @@ class CameraClient:
         self.last_apriltag_update = 0
         self.apriltag_update_interval = apriltag_update_interval
         self.apriltag_update_count = 0  # Track number of updates
+        
+        # Camera pose broadcast (send pose info even without detections)
+        self.last_pose_broadcast = 0
+        self.pose_broadcast_interval = 3.0  # Send pose every 3 seconds even without detections
+        self.pose_broadcast_count = 0
     
     def test_connection(self):
         """Test UDP connection to the server."""
@@ -618,6 +731,42 @@ class CameraClient:
         
         return success
     
+    def send_pose_broadcast(self) -> bool:
+        """
+        Send camera pose information to server even without detections.
+        This ensures the camera appears in the fusion server plot.
+        
+        Returns:
+            True if packet was sent successfully
+        """
+        current_time = time.time()
+        if current_time - self.last_pose_broadcast < self.pose_broadcast_interval:
+            return False
+        
+        packet = {
+            "cam_id": self.pose['cam_id'],
+            "pose_broadcast": True,  # Flag to indicate this is a pose-only packet
+            "timestamp": current_time,
+            "pose": {
+                "x": self.pose['x'],
+                "y": self.pose['y'],
+                "yaw_deg": self.pose['yaw_deg'],
+                "fov_deg": self.pose['fov_deg'],
+                "img_w": self.pose['img_w'],
+                "img_h": self.pose['img_h']
+            }
+        }
+        
+        success = udp_send_with_retry(packet, self.server_addr)
+        if success:
+            self.last_pose_broadcast = current_time
+            self.pose_broadcast_count += 1
+            print(f"📡 Sent pose broadcast #{self.pose_broadcast_count} for camera {self.pose['cam_id']}")
+        else:
+            print(f"❌ Failed to send pose broadcast for camera {self.pose['cam_id']}")
+        
+        return success
+    
     async def run_detection_loop(self):
         """Main detection loop running at specified FPS."""
         self.start_capture()
@@ -661,6 +810,9 @@ class CameraClient:
                 if apriltag_updated:
                     apriltag_pose_updates += 1
                 
+                # Send regular pose broadcasts to server (even without detections)
+                pose_broadcast_sent = self.send_pose_broadcast()
+                
                 # Run object detection
                 detections = self.detect_objects(frame)
                 detection_count += len(detections)
@@ -694,27 +846,103 @@ class CameraClient:
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 # Show resolution info and flip status
-                res_text = f"Resolution: {self.actual_resolution[0]}x{self.actual_resolution[1]} | Flip: {'ON' if self.flip_horizontal else 'OFF'}"
+                res_text = f"Resolution: {self.actual_resolution[0]}x{self.actual_resolution[1]} | Flip: {'ON' if self.flip_horizontal else 'Disabled'}"
                 cv2.putText(display_frame, res_text,
                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 
-                # Show AprilTag pose status if enabled
-                if self.enable_apriltag_pose:
-                    apriltag_text = f"AprilTag Updates: {self.apriltag_update_count} | Last: {time.time() - self.last_apriltag_update:.1f}s ago"
-                    cv2.putText(display_frame, apriltag_text,
-                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                # Show AprilTag pose status if enabled - COMPREHENSIVE DEBUG INFO
+                if self.enable_apriltag_pose and self.apriltag_estimator is not None:
+                    y_offset = 120
                     
-                    # Show current pose
-                    pose_text = f"Pose: ({self.pose['x']:.1f}, {self.pose['y']:.1f}) {self.pose['yaw_deg']:.0f}°"
-                    cv2.putText(display_frame, pose_text,
-                               (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    # Get current AprilTag detection status
+                    detected_tags = self.apriltag_estimator.detect_apriltags(frame)
+                    detection_summary = self.apriltag_estimator.get_detection_summary()
                     
                     # Show AprilTag detection statistics
-                    if hasattr(self.apriltag_estimator, 'get_detection_summary'):
-                        summary = self.apriltag_estimator.get_detection_summary()
-                        stats_text = f"AprilTag Rate: {summary['detection_rate_percent']:.1f}% | Pose Success: {summary['pose_success_rate_percent']:.1f}%"
-                        cv2.putText(display_frame, stats_text,
-                                   (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    apriltag_text = f"AprilTag Updates: {self.apriltag_update_count} | Last: {time.time() - self.last_apriltag_update:.1f}s ago"
+                    cv2.putText(display_frame, apriltag_text,
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    y_offset += 30
+                    
+                    # Show detection rate and frame processing
+                    detect_rate_text = f"AprilTag Rate: {detection_summary['detection_rate_percent']:.1f}% | Frames: {detection_summary['total_frames']}"
+                    cv2.putText(display_frame, detect_rate_text,
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    y_offset += 25
+                    
+                    # Show pose success rate
+                    pose_success_text = f"Pose Success: {detection_summary['pose_success_rate_percent']:.1f}% | Total Tags: {detection_summary['total_tags_detected']}"
+                    cv2.putText(display_frame, pose_success_text,
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    y_offset += 25
+                    
+                    # Show current pose
+                    pose_text = f"Pose: ({self.pose['x']:.2f}, {self.pose['y']:.2f}) | Yaw: {self.pose['yaw_deg']:.1f}° | FOV: {self.pose['fov_deg']:.1f}°"
+                    cv2.putText(display_frame, pose_text,
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    y_offset += 25
+                    
+                    # Show detected tags in current frame with detailed info
+                    if detected_tags:
+                        tags_text = f"Current Frame: {len(detected_tags)} tags detected"
+                        cv2.putText(display_frame, tags_text,
+                                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        y_offset += 20
+                        
+                        # Show each detected tag
+                        for i, tag in enumerate(detected_tags[:3]):  # Show max 3 tags to avoid clutter
+                            tag_id = tag['id']
+                            confidence = tag['confidence']
+                            area = tag.get('area', 0)
+                            pos = tag['tag_info']['position']
+                            
+                            tag_detail = f"  Tag {tag_id}: conf={confidence:.3f}, area={area:.0f}px², pos=({pos[0]}, {pos[1]})"
+                            cv2.putText(display_frame, tag_detail,
+                                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                            y_offset += 18
+                            
+                            # Draw tag detection on frame
+                            corners = tag['corners']
+                            center = tag['center']
+                            
+                            # Draw tag corners and outline
+                            corners_int = corners.astype(int)
+                            cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
+                            
+                            # Draw tag ID and confidence at center
+                            cv2.putText(display_frame, f"ID:{tag_id}", 
+                                       (int(center[0]) - 30, int(center[1]) - 15),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            cv2.putText(display_frame, f"C:{confidence:.2f}", 
+                                       (int(center[0]) - 30, int(center[1])),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                            
+                            # Draw center point
+                            cv2.circle(display_frame, (int(center[0]), int(center[1])), 5, (0, 0, 255), -1)
+                    else:
+                        no_tags_text = "Current Frame: No AprilTags detected"
+                        cv2.putText(display_frame, no_tags_text,
+                                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                        y_offset += 25
+                    
+                    # Show per-tag detection history
+                    if detection_summary['tag_detection_counts']:
+                        history_text = "Tag History:"
+                        cv2.putText(display_frame, history_text,
+                                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        y_offset += 20
+                        
+                        for tag_id, counts in detection_summary['tag_detection_counts'].items():
+                            success_rate = (counts['accepted'] / counts['seen']) * 100 if counts['seen'] > 0 else 0
+                            tag_history = f"  Tag {tag_id}: {counts['accepted']}/{counts['seen']} ({success_rate:.1f}%)"
+                            cv2.putText(display_frame, tag_history,
+                                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                            y_offset += 18
+                    
+                    # Show server connection status
+                    server_text = f"Server: {self.server_addr[0]}:{self.server_addr[1]} | Updates: {self.apriltag_update_count} | Broadcasts: {self.pose_broadcast_count}"
+                    cv2.putText(display_frame, server_text,
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
                 
                 # Draw crosshairs for reference
                 h, w = display_frame.shape[:2]
@@ -756,6 +984,7 @@ class CameraClient:
                     print(f"   AprilTag detection rate: {summary['detection_rate_percent']:.1f}%")
                     print(f"   AprilTag pose success rate: {summary['pose_success_rate_percent']:.1f}%")
                     print(f"   Total AprilTags detected: {summary['total_tags_detected']}")
+            print(f"   Pose broadcasts sent: {self.pose_broadcast_count}")
             if frame_count > 0:
                 print(f"   Detection rate: {detection_count/frame_count:.2f} detections/frame")
             

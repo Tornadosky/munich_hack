@@ -199,7 +199,38 @@ class FusionServer:
                 print(f"   📡 Test packet received from {cam_id} - connection OK")
                 return
             
-            # Validate required fields
+            # Check if this is a pose broadcast packet (no detection data)
+            if packet.get('pose_broadcast', False):
+                print(f"   📡 Pose broadcast received from {cam_id}")
+                
+                # Update camera pose if provided
+                if 'pose' in packet:
+                    pose_info = packet['pose']
+                    print(f"   📐 Pose info: pos=({pose_info.get('x', '?')}, {pose_info.get('y', '?')}), yaw={pose_info.get('yaw_deg', '?')}°")
+                    
+                    if cam_id not in self.poses:
+                        # New camera discovered via pose broadcast
+                        self.poses[cam_id] = pose_info
+                        print(f"   ✅ NEW CAMERA DISCOVERED (broadcast): {cam_id} at ({pose_info['x']}, {pose_info['y']}) facing {pose_info['yaw_deg']}°")
+                        self.plot_needs_update = True
+                    else:
+                        # Update existing camera pose if it changed
+                        if self.poses[cam_id] != pose_info:
+                            print(f"   📝 Updated pose for camera {cam_id} (broadcast)")
+                            self.poses[cam_id] = pose_info
+                            self.plot_needs_update = True
+                        else:
+                            print(f"   ✅ Pose confirmed for camera {cam_id} (broadcast)")
+                
+                # If camera just became active, update plot
+                if not was_active:
+                    print(f"   🟢 Camera {cam_id} is now ACTIVE (via broadcast)")
+                    self.plot_needs_update = True
+                
+                # Don't proceed with triangulation for broadcast packets
+                return
+            
+            # Validate required fields for detection packets
             required_fields = ['cam_id', 'cx', 'cy', 'timestamp']
             missing_fields = [field for field in required_fields if field not in packet]
             if missing_fields:

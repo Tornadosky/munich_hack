@@ -50,13 +50,26 @@ class AprilTagPoseEstimator:
         self.dist_coeffs = np.array(self.config['camera_intrinsics']['distortion_coeffs'], dtype=np.float32)
         self.camera_matrix = None
         
-        # Initialize AprilTag detector
+        # Initialize AprilTag detector using robotpy_apriltag
         try:
-            import apriltag
-            self.detector = apriltag.Detector(apriltag.DetectorOptions(families=self.config['tag_family']))
-            print(f"✅ AprilTag detector initialized with family {self.config['tag_family']}")
+            import robotpy_apriltag as apriltag
+            self.detector = apriltag.AprilTagDetector()
+            
+            # Configure the detector based on tag family
+            if self.config['tag_family'] == 'tag36h11':
+                self.detector.addFamily("tag36h11", 0)  # 0 bit correction
+            elif self.config['tag_family'] == 'tag25h9':
+                self.detector.addFamily("tag25h9", 0)
+            elif self.config['tag_family'] == 'tag16h5':
+                self.detector.addFamily("tag16h5", 0)
+            else:
+                # Default to tag36h11
+                self.detector.addFamily("tag36h11", 0)
+                print(f"⚠️  Unknown tag family '{self.config['tag_family']}', using tag36h11")
+            
+            print(f"✅ RobotPy AprilTag detector initialized with family {self.config['tag_family']}")
         except ImportError:
-            raise ImportError("AprilTag library not found. Install with: pip install apriltag")
+            raise ImportError("robotpy-apriltag library not found. Install with: pip install robotpy-apriltag")
         
         # Pose estimation parameters
         self.max_reproj_error = self.config['pose_estimation']['max_reproj_error']
@@ -126,7 +139,7 @@ class AprilTagPoseEstimator:
         else:
             gray = frame
         
-        # Detect tags
+        # Detect tags using robotpy_apriltag
         start_time = time.time()
         detections = self.detector.detect(gray)
         detection_time = time.time() - start_time
@@ -135,8 +148,8 @@ class AprilTagPoseEstimator:
         rejected_tags = []
         
         for detection in detections:
-            tag_id = detection.tag_id
-            confidence = detection.decision_margin
+            tag_id = detection.getId()
+            confidence = detection.getDecisionMargin()
             
             # Log detection attempt
             if tag_id not in self.detection_stats['tag_detection_counts']:
@@ -156,8 +169,17 @@ class AprilTagPoseEstimator:
                 print(f"⚠️  Detected unknown tag ID {tag_id} (confidence: {confidence:.3f}) - skipping")
                 continue
             
-            # Extract corner coordinates
-            corners = detection.corners.astype(np.float32)
+            # Extract corner coordinates from robotpy_apriltag detection
+            corners = np.array([
+                [detection.getCorner(0).x, detection.getCorner(0).y],
+                [detection.getCorner(1).x, detection.getCorner(1).y],
+                [detection.getCorner(2).x, detection.getCorner(2).y],
+                [detection.getCorner(3).x, detection.getCorner(3).y]
+            ], dtype=np.float32)
+            
+            # Calculate center point
+            center = detection.getCenter()
+            center_point = (center.x, center.y)
             
             # Calculate tag area and aspect ratio for quality assessment
             tag_area = cv2.contourArea(corners)
@@ -170,7 +192,7 @@ class AprilTagPoseEstimator:
             detected_tags.append({
                 'id': tag_id,
                 'corners': corners,
-                'center': detection.center,
+                'center': center_point,
                 'confidence': confidence,
                 'tag_info': self.tag_positions[tag_id],
                 'area': tag_area,

@@ -88,7 +88,15 @@ class FakeCamera:
             "cam_id": self.pose['cam_id'],
             "cx": cx,
             "cy": cy,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "pose": {
+                "x": self.pose['x'],
+                "y": self.pose['y'],
+                "yaw_deg": self.pose['yaw_deg'],
+                "fov_deg": self.pose['fov_deg'],
+                "img_w": self.pose['img_w'],
+                "img_h": self.pose['img_h']
+            }
         }
         
         udp_send(packet, self.server_addr)
@@ -183,11 +191,11 @@ async def main():
     print("Created pose files: pose_A.json, pose_B.json")
     
     # Create fake cameras
-    fake_cam_a = FakeCamera(pose_a, server_addr, fps=2.0)
-    fake_cam_b = FakeCamera(pose_b, server_addr, fps=2.0)
+    fake_cam_a = FakeCamera(pose_a, server_addr, fps=30.0)
+    fake_cam_b = FakeCamera(pose_b, server_addr, fps=30.0)
     
     # Generate object path
-    object_path = generate_object_path(duration=30.0, fps=2.0)
+    object_path = generate_object_path(duration=30.0, fps=30.0)
     
     print(f"Starting demo with {len(object_path)} path points")
     print("Make sure fusion_server.py is running!")

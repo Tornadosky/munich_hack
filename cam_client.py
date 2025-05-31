@@ -104,7 +104,15 @@ class CameraClient:
             "cam_id": self.pose['cam_id'],
             "cx": cx,
             "cy": cy,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "pose": {
+                "x": self.pose['x'],
+                "y": self.pose['y'],
+                "yaw_deg": self.pose['yaw_deg'],
+                "fov_deg": self.pose['fov_deg'],
+                "img_w": self.pose['img_w'],
+                "img_h": self.pose['img_h']
+            }
         }
         
         udp_send(packet, self.server_addr)

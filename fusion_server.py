@@ -50,7 +50,11 @@ class FusionServer:
         
         # Storage for latest detections per camera
         self.latest_detections = {}
-        self.time_window = 0.5  # seconds
+        self.time_window = 2  # seconds
+        
+        # Storage for detection rays (for visualization)
+        self.detection_rays = {}  # cam_id -> (ray_start, ray_end, timestamp)
+        self.ray_timeout = 2.0  # Show rays for 2 seconds
         
         # Triangulated positions for plotting (thread-safe)
         self.positions = []
@@ -180,9 +184,39 @@ class FusionServer:
         Args:
             packet: Detection packet with cam_id, cx, cy, timestamp, and optionally pose info
         """
-        cam_id = packet['cam_id']
-        timestamp = packet['timestamp']
-        current_time = time.time()
+        # Enhanced packet validation and debugging
+        try:
+            cam_id = packet['cam_id']
+            timestamp = packet['timestamp']
+            current_time = time.time()
+            
+            # Debug: Print detailed packet info
+            print(f"\n🔍 Processing packet from camera {cam_id}:")
+            print(f"   Timestamp: {timestamp:.3f} (age: {(current_time - timestamp)*1000:.1f}ms)")
+            
+            # Check if this is a test packet
+            if packet.get('test', False):
+                print(f"   📡 Test packet received from {cam_id} - connection OK")
+                return
+            
+            # Validate required fields
+            required_fields = ['cam_id', 'cx', 'cy', 'timestamp']
+            missing_fields = [field for field in required_fields if field not in packet]
+            if missing_fields:
+                print(f"   ❌ Missing required fields: {missing_fields}")
+                return
+            
+            cx, cy = packet['cx'], packet['cy']
+            confidence = packet.get('confidence', 'unknown')
+            print(f"   📍 Detection: cx={cx:.1f}, cy={cy:.1f}, confidence={confidence}")
+            
+        except KeyError as e:
+            print(f"❌ Invalid packet structure - missing key: {e}")
+            print(f"   Packet keys: {list(packet.keys())}")
+            return
+        except Exception as e:
+            print(f"❌ Error parsing packet: {e}")
+            return
         
         # Update camera last-seen timestamp
         was_active = cam_id in self.camera_last_seen and (current_time - self.camera_last_seen[cam_id]) <= self.camera_timeout
@@ -191,53 +225,82 @@ class FusionServer:
         # Check if packet contains camera pose information
         if 'pose' in packet:
             pose_info = packet['pose']
+            print(f"   📐 Pose info: pos=({pose_info.get('x', '?')}, {pose_info.get('y', '?')}), yaw={pose_info.get('yaw_deg', '?')}°")
+            
             if cam_id not in self.poses:
                 # New camera discovered
                 self.poses[cam_id] = pose_info
-                print(f"Discovered new camera {cam_id} at ({pose_info['x']}, {pose_info['y']}) facing {pose_info['yaw_deg']}°")
+                print(f"   ✅ NEW CAMERA DISCOVERED: {cam_id} at ({pose_info['x']}, {pose_info['y']}) facing {pose_info['yaw_deg']}°")
                 self.plot_needs_update = True
             else:
                 # Update existing camera pose if it changed
                 if self.poses[cam_id] != pose_info:
+                    print(f"   📝 Updated pose for camera {cam_id}")
                     self.poses[cam_id] = pose_info
-                    print(f"Updated pose for camera {cam_id}")
                     self.plot_needs_update = True
+                else:
+                    print(f"   ✅ Pose confirmed for camera {cam_id}")
+        else:
+            print(f"   ⚠️  No pose info in packet")
+            if cam_id not in self.poses:
+                print(f"   ❌ No pose available for camera {cam_id} - cannot triangulate")
+                return
         
         # If camera just became active, update plot
         if not was_active:
-            print(f"Camera {cam_id} is now active")
+            print(f"   🟢 Camera {cam_id} is now ACTIVE")
             self.plot_needs_update = True
         
         # Store latest detection for this camera
         self.latest_detections[cam_id] = packet
+        print(f"   💾 Stored detection for camera {cam_id}")
+        
+        # Calculate and store detection ray for visualization
+        self.calculate_detection_ray(cam_id, cx, cy, current_time)
         
         # Get list of active cameras (have sent data recently)
         active_cameras = self.get_active_cameras()
+        print(f"   📊 Active cameras: {list(active_cameras)} (total: {len(active_cameras)})")
         
         # Check if we have enough active cameras for triangulation
         if len(active_cameras) < 2:
-            return  # Need at least 2 active cameras
+            print(f"   ⏳ Need at least 2 active cameras for triangulation (have {len(active_cameras)})")
+            return
         
         # Try triangulation with other active cameras
+        triangulation_attempts = 0
+        successful_triangulations = 0
+        
         for other_cam_id, other_detection in self.latest_detections.items():
             if other_cam_id == cam_id:
                 continue
             
+            triangulation_attempts += 1
+            print(f"\n   🔄 Triangulation attempt {triangulation_attempts}: {cam_id} + {other_cam_id}")
+            
             # Check if other camera is active
             if other_cam_id not in active_cameras:
+                print(f"      ❌ Camera {other_cam_id} not active")
                 continue
             
             # Check if we have pose info for both cameras
             if cam_id not in self.poses or other_cam_id not in self.poses:
+                print(f"      ❌ Missing pose info: {cam_id} in poses: {cam_id in self.poses}, {other_cam_id} in poses: {other_cam_id in self.poses}")
                 continue
             
             # Check if detections are within time window
             time_diff = abs(timestamp - other_detection['timestamp'])
+            print(f"      ⏱️  Time difference: {time_diff:.3f}s (limit: {self.time_window}s)")
             if time_diff > self.time_window:
+                print(f"      ❌ Time difference too large")
                 continue
             
             # Perform triangulation
             try:
+                print(f"      🎯 Attempting triangulation...")
+                print(f"         Cam {cam_id}: cx={cx:.1f}, pose=({self.poses[cam_id]['x']}, {self.poses[cam_id]['y']})")
+                print(f"         Cam {other_cam_id}: cx={other_detection['cx']:.1f}, pose=({self.poses[other_cam_id]['x']}, {self.poses[other_cam_id]['y']})")
+                
                 position = self.triangulate_pair(packet, other_detection)
                 age_ms = (current_time - min(timestamp, other_detection['timestamp'])) * 1000
                 
@@ -252,12 +315,73 @@ class FusionServer:
                 result = {
                     "x": float(position[0]),
                     "y": float(position[1]),
-                    "age_ms": int(age_ms)
+                    "age_ms": int(age_ms),
+                    "cameras": [cam_id, other_cam_id]
                 }
-                print(json.dumps(result))
+                print(f"      ✅ TRIANGULATION SUCCESS: {json.dumps(result)}")
+                successful_triangulations += 1
                 
             except Exception as e:
-                print(f"Triangulation failed: {e}")
+                print(f"      ❌ Triangulation failed: {e}")
+                import traceback
+                print(f"         {traceback.format_exc()}")
+        
+        print(f"   📈 Triangulation summary: {successful_triangulations}/{triangulation_attempts} successful")
+        
+        # Print current system status
+        self.print_status_summary()
+    
+    def calculate_detection_ray(self, cam_id: str, cx: float, cy: float, timestamp: float):
+        """
+        Calculate and store detection ray for visualization.
+        
+        Args:
+            cam_id: Camera identifier
+            cx, cy: Pixel coordinates of detection
+            timestamp: Detection timestamp
+        """
+        if cam_id not in self.poses:
+            return
+        
+        try:
+            # Get camera pose
+            pose = self.poses[cam_id]
+            
+            # Calculate ray direction from pixel coordinates
+            ray_direction = ray_from_pixel(cx, pose)
+            
+            # Camera position
+            cam_pos = np.array([pose['x'], pose['y']])
+            
+            # Calculate ray end point (extend ray for visualization)
+            ray_length = 8.0  # meters - how far to draw the ray
+            ray_end = cam_pos + ray_direction * ray_length
+            
+            # Store ray for visualization
+            self.detection_rays[cam_id] = {
+                'start': cam_pos,
+                'end': ray_end,
+                'timestamp': timestamp,
+                'cx': cx,
+                'cy': cy
+            }
+            
+            print(f"   📡 Detection ray: {cam_id} from ({cam_pos[0]:.1f}, {cam_pos[1]:.1f}) to ({ray_end[0]:.1f}, {ray_end[1]:.1f})")
+            
+        except Exception as e:
+            print(f"   ❌ Error calculating detection ray for {cam_id}: {e}")
+    
+    def cleanup_old_detection_rays(self):
+        """Remove detection rays older than ray_timeout."""
+        current_time = time.time()
+        expired_rays = []
+        
+        for cam_id, ray_data in self.detection_rays.items():
+            if (current_time - ray_data['timestamp']) > self.ray_timeout:
+                expired_rays.append(cam_id)
+        
+        for cam_id in expired_rays:
+            del self.detection_rays[cam_id]
     
     def get_active_cameras(self) -> set:
         """
@@ -296,6 +420,10 @@ class FusionServer:
             
             if cam_id in self.latest_detections:
                 del self.latest_detections[cam_id]
+            
+            # Also remove detection rays for inactive cameras
+            if cam_id in self.detection_rays:
+                del self.detection_rays[cam_id]
     
     def triangulate_pair(self, detection1: dict, detection2: dict) -> np.ndarray:
         """
@@ -327,7 +455,7 @@ class FusionServer:
     def cleanup_old_positions(self):
         """Remove position data older than 0.5 seconds. Must be called with lock held."""
         current_time = time.time()
-        cutoff_time = current_time - 0.05  # Keep positions for only 0.5 seconds
+        cutoff_time = current_time - 0.5  # Keep positions for only 0.5 seconds
         
         # Filter out old positions
         valid_indices = [i for i, t in enumerate(self.timestamps) if t > cutoff_time]
@@ -340,13 +468,17 @@ class FusionServer:
             return self.scatter,
         
         # Check for inactive cameras every 20 frames (~1 second at 50ms intervals)
-        if frame % 5 == 0:
+        if frame % 20 == 0:
             self.cleanup_inactive_cameras()
+            self.cleanup_old_detection_rays()
         
         # Check if we need to redraw cameras due to new discoveries or removals
         if self.plot_needs_update:
             self.redraw_cameras()
             self.plot_needs_update = False
+        else:
+            # Only update detection rays if we're not doing a full redraw
+            self.update_detection_rays()
             
         with self._positions_lock:
             # Clean up old positions regularly (every frame)
@@ -374,61 +506,106 @@ class FusionServer:
                     x_min, x_max = min(all_x) - margin, max(all_x) + margin
                     y_min, y_max = min(all_y) - margin, max(all_y) + margin
                     
-                    self.ax.set_xlim(x_min, x_max)
-                    self.ax.set_ylim(y_min, y_max)
+                    # Only update limits if they've changed significantly
+                    current_xlim = self.ax.get_xlim()
+                    current_ylim = self.ax.get_ylim()
+                    
+                    if (abs(current_xlim[0] - x_min) > 0.5 or abs(current_xlim[1] - x_max) > 0.5 or
+                        abs(current_ylim[0] - y_min) > 0.5 or abs(current_ylim[1] - y_max) > 0.5):
+                        self.ax.set_xlim(x_min, x_max)
+                        self.ax.set_ylim(y_min, y_max)
                 
-                # Force canvas refresh
-                self.fig.canvas.draw_idle()
+                # Force canvas refresh only when needed
+                if frame % 5 == 0:  # Refresh every 5 frames to reduce CPU usage
+                    self.fig.canvas.draw_idle()
             else:
                 # No positions - clear the scatter plot
                 self.scatter.set_offsets(np.empty((0, 2)))
         
         return self.scatter,
     
+    def update_detection_rays(self):
+        """Update detection ray visualization on the plot."""
+        # Since we're using a clear-and-redraw approach in redraw_cameras(),
+        # we only need to draw current detection rays without removing old ones
+        
+        # Draw current detection rays
+        current_time = time.time()
+        for cam_id, ray_data in self.detection_rays.items():
+            # Check if ray is still valid (not too old)
+            ray_age = current_time - ray_data['timestamp']
+            if ray_age > self.ray_timeout:
+                continue
+            
+            # Calculate alpha based on age (fade out over time)
+            alpha = max(0.1, 1.0 - (ray_age / self.ray_timeout))
+            
+            # Choose color based on camera ID
+            colors = {'A': 'red', 'B': 'blue', 'C': 'green', 'D': 'orange'}
+            color = colors.get(cam_id, 'purple')
+            
+            # Draw detection ray
+            start = ray_data['start']
+            end = ray_data['end']
+            
+            self.ax.plot([start[0], end[0]], [start[1], end[1]], 
+                        color=color, linewidth=3, alpha=alpha, 
+                        linestyle='--', zorder=4,
+                        label=f'Detection Ray {cam_id}')
+            
+            # Add arrow at the end to show direction
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = np.sqrt(dx**2 + dy**2)
+            if length > 0:
+                # Normalize direction
+                dx_norm = dx / length
+                dy_norm = dy / length
+                
+                # Arrow properties
+                arrow_length = 0.5
+                arrow_end_x = end[0] - dx_norm * arrow_length
+                arrow_end_y = end[1] - dy_norm * arrow_length
+                
+                self.ax.annotate('', xy=(end[0], end[1]), 
+                               xytext=(arrow_end_x, arrow_end_y),
+                               arrowprops=dict(arrowstyle='->', color=color, 
+                                             alpha=alpha, lw=2),
+                               zorder=5)
+            
+            # Add detection info text near the camera
+            info_x = start[0] + 0.3
+            info_y = start[1] + 0.3
+            self.ax.text(info_x, info_y, 
+                        f'{cam_id}: ({ray_data["cx"]:.0f},{ray_data["cy"]:.0f})',
+                        fontsize=8, color=color, alpha=alpha,
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                                alpha=0.7), zorder=6)
+    
     def redraw_cameras(self):
         """Redraw all camera positions and FOVs when cameras are added/updated."""
-        # Clear ALL camera-related visual elements
-        artists_to_remove = []
+        # Instead of trying to remove individual artists (which can fail),
+        # we'll clear the entire plot and redraw everything
         
-        # Get all children and identify camera-related artists
-        for artist in self.ax.get_children():
-            try:
-                # Check various artist types that might be camera-related
-                if hasattr(artist, 'get_label'):
-                    label = artist.get_label()
-                    label_str = str(label) if label is not None else ""
-                    if label_str and ('Cam ' in label_str or 'FOV ' in label_str):
-                        artists_to_remove.append(artist)
-                
-                # Also check for polygons/patches that might be FOV triangles
-                # (these might not have proper labels)
-                if hasattr(artist, 'get_facecolor') and hasattr(artist, 'get_alpha'):
-                    # This is likely a filled polygon (FOV triangle)
-                    alpha = artist.get_alpha()
-                    if alpha is not None and 0.1 <= alpha <= 0.3:  # FOV triangles have alpha 0.2
-                        artists_to_remove.append(artist)
-                
-                # Check for lines that might be FOV boundaries or center lines
-                if hasattr(artist, 'get_linewidth') and hasattr(artist, 'get_alpha'):
-                    alpha = artist.get_alpha()
-                    if alpha is not None and 0.4 <= alpha <= 0.8:  # FOV lines have alpha 0.5-0.7
-                        # Additional check: see if it's not the grid or axes
-                        if not hasattr(artist, 'get_transform') or 'grid' not in str(type(artist)).lower():
-                            artists_to_remove.append(artist)
-                            
-            except (AttributeError, TypeError, ValueError):
-                # Skip artists that cause errors
-                continue
+        # Save current axis limits
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
         
-        # Remove all identified camera-related artists
-        for artist in artists_to_remove:
-            try:
-                artist.remove()
-            except (ValueError, AttributeError):
-                # Artist might already be removed or not removable
-                pass
+        # Clear the entire plot
+        self.ax.clear()
         
-        # Only redraw cameras that are currently active
+        # Restore plot settings
+        self.ax.set_xlabel('X (meters)')
+        self.ax.set_ylabel('Y (meters)')
+        self.ax.set_title('Object Position Triangulation')
+        self.ax.grid(True)
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
+        
+        # Recreate the scatter plot for object positions
+        self.scatter = self.ax.scatter([], [], c='blue', s=100, alpha=1.0, zorder=5, edgecolors='black', linewidth=1)
+        
+        # Redraw all active cameras
         active_cameras = self.get_active_cameras()
         active_count = 0
         
@@ -479,6 +656,39 @@ class FusionServer:
         self.running = False
         if hasattr(self, 'server_thread'):
             self.server_thread.join(timeout=1.0)
+    
+    def print_status_summary(self):
+        """Print a summary of current system status."""
+        current_time = time.time()
+        active_cameras = self.get_active_cameras()
+        
+        print(f"\n📊 SYSTEM STATUS:")
+        print(f"   🎥 Total cameras known: {len(self.poses)}")
+        print(f"   🟢 Active cameras: {len(active_cameras)} {list(active_cameras)}")
+        print(f"   📡 Recent detections: {len(self.latest_detections)}")
+        print(f"   📡 Active detection rays: {len(self.detection_rays)}")
+        
+        # Show camera details
+        for cam_id, pose in self.poses.items():
+            is_active = cam_id in active_cameras
+            last_seen = self.camera_last_seen.get(cam_id, 0)
+            age = current_time - last_seen if last_seen > 0 else float('inf')
+            
+            # Check if camera has recent detection ray
+            ray_info = ""
+            if cam_id in self.detection_rays:
+                ray_age = current_time - self.detection_rays[cam_id]['timestamp']
+                ray_info = f" | Ray: {ray_age:.1f}s ago"
+            
+            status = "🟢 ACTIVE" if is_active else f"🔴 INACTIVE ({age:.1f}s ago)"
+            
+            print(f"      Cam {cam_id}: {status} at ({pose['x']}, {pose['y']}) facing {pose['yaw_deg']}°{ray_info}")
+        
+        # Show triangulation data
+        with self._positions_lock:
+            print(f"   📍 Triangulated positions: {len(self.positions)} (last {0.5}s)")
+        
+        print("=" * 60)
 
 
 def main():

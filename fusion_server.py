@@ -690,7 +690,7 @@ class FusionServer:
                 continue
             
             # Calculate alpha based on age (fade out over time)
-            alpha = max(0.1, 1.0 - (ray_age / self.ray_timeout))
+            alpha = max(0.1, min(1.0, 1.0 - (ray_age / self.ray_timeout)))
             
             # Choose color based on camera ID
             colors = {'A': 'red', 'B': 'blue', 'C': 'green', 'D': 'orange'}

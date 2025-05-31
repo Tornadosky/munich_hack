@@ -194,6 +194,10 @@ class FusionServer:
             print(f"\n🔍 Processing packet from camera {cam_id}:")
             print(f"   Timestamp: {timestamp:.3f} (age: {(current_time - timestamp)*1000:.1f}ms)")
             
+            # Update camera last-seen timestamp
+            was_active = cam_id in self.camera_last_seen and (current_time - self.camera_last_seen[cam_id]) <= self.camera_timeout
+            self.camera_last_seen[cam_id] = current_time
+            
             # Check if this is a test packet
             if packet.get('test', False):
                 print(f"   📡 Test packet received from {cam_id} - connection OK")
@@ -201,7 +205,9 @@ class FusionServer:
             
             # Check if this is a pose broadcast packet (no detection data)
             if packet.get('pose_broadcast', False):
-                print(f"   📡 Pose broadcast received from {cam_id}")
+                is_immediate = packet.get('immediate_update', False)
+                broadcast_type = "IMMEDIATE pose update" if is_immediate else "scheduled pose broadcast"
+                print(f"   📡 {broadcast_type} received from {cam_id}")
                 
                 # Update camera pose if provided
                 if 'pose' in packet:
@@ -211,20 +217,29 @@ class FusionServer:
                     if cam_id not in self.poses:
                         # New camera discovered via pose broadcast
                         self.poses[cam_id] = pose_info
-                        print(f"   ✅ NEW CAMERA DISCOVERED (broadcast): {cam_id} at ({pose_info['x']}, {pose_info['y']}) facing {pose_info['yaw_deg']}°")
+                        print(f"   ✅ NEW CAMERA DISCOVERED ({broadcast_type}): {cam_id} at ({pose_info['x']}, {pose_info['y']}) facing {pose_info['yaw_deg']}°")
                         self.plot_needs_update = True
                     else:
-                        # Update existing camera pose if it changed
-                        if self.poses[cam_id] != pose_info:
-                            print(f"   📝 Updated pose for camera {cam_id} (broadcast)")
+                        # Check if pose actually changed
+                        old_pose = self.poses[cam_id]
+                        pose_changed = (
+                            abs(old_pose.get('x', 0) - pose_info.get('x', 0)) > 0.001 or
+                            abs(old_pose.get('y', 0) - pose_info.get('y', 0)) > 0.001 or
+                            abs(old_pose.get('yaw_deg', 0) - pose_info.get('yaw_deg', 0)) > 0.1
+                        )
+                        
+                        if pose_changed:
+                            print(f"   📝 POSE CHANGED for camera {cam_id}:")
+                            print(f"      Old: ({old_pose.get('x', 0):.3f}, {old_pose.get('y', 0):.3f}) {old_pose.get('yaw_deg', 0):.1f}°")
+                            print(f"      New: ({pose_info['x']:.3f}, {pose_info['y']:.3f}) {pose_info['yaw_deg']:.1f}°")
                             self.poses[cam_id] = pose_info
                             self.plot_needs_update = True
                         else:
-                            print(f"   ✅ Pose confirmed for camera {cam_id} (broadcast)")
+                            print(f"   ✅ Pose confirmed for camera {cam_id} ({broadcast_type})")
                 
                 # If camera just became active, update plot
                 if not was_active:
-                    print(f"   🟢 Camera {cam_id} is now ACTIVE (via broadcast)")
+                    print(f"   🟢 Camera {cam_id} is now ACTIVE (via {broadcast_type})")
                     self.plot_needs_update = True
                 
                 # Don't proceed with triangulation for broadcast packets
@@ -248,10 +263,6 @@ class FusionServer:
         except Exception as e:
             print(f"❌ Error parsing packet: {e}")
             return
-        
-        # Update camera last-seen timestamp
-        was_active = cam_id in self.camera_last_seen and (current_time - self.camera_last_seen[cam_id]) <= self.camera_timeout
-        self.camera_last_seen[cam_id] = current_time
         
         # Check if packet contains camera pose information
         if 'pose' in packet:

@@ -13,7 +13,7 @@ import socket
 import numpy as np
 import math
 from ultralytics import YOLO
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 def udp_send_with_retry(payload: dict, addr: tuple, max_retries: int = 3) -> bool:
@@ -97,19 +97,46 @@ class AprilTagPoseEstimator:
         self.dist_coeffs = np.array(self.config['camera_intrinsics']['distortion_coeffs'], dtype=np.float32)
         self.camera_matrix = None
         
-        # Initialize AprilTag detector
+        # Initialize AprilTag detector with robotpy_apriltag
         try:
-            import apriltag
-            self.detector = apriltag.Detector(apriltag.DetectorOptions(families=self.config['tag_family']))
-            print(f"✅ AprilTag detector ready with family {self.config['tag_family']}")
+            import robotpy_apriltag as apriltag
+            self.detector = apriltag.AprilTagDetector()
+            
+            # Configure the detector based on tag family
+            if self.config['tag_family'] == 'tag36h11':
+                self.detector.addFamily("tag36h11", 0)  # 0 bit correction
+            elif self.config['tag_family'] == 'tag25h9':
+                self.detector.addFamily("tag25h9", 0)
+            elif self.config['tag_family'] == 'tag16h5':
+                self.detector.addFamily("tag16h5", 0)
+            else:
+                # Default to tag36h11
+                self.detector.addFamily("tag36h11", 0)
+                print(f"⚠️  Unknown tag family '{self.config['tag_family']}', using tag36h11")
+            
+            print(f"✅ robotpy-apriltag detector ready with family {self.config['tag_family']}")
         except ImportError:
-            print(f"❌ AprilTag library not found. Install with: pip install apriltag")
+            print(f"❌ robotpy-apriltag library not found. Install with: pip install robotpy-apriltag")
             raise
         
         # Pose estimation parameters
         self.max_reproj_error = self.config['pose_estimation']['max_reproj_error']
         self.min_detection_confidence = self.config['pose_estimation']['min_detection_confidence']
         
+        # Initialize detection statistics
+        self.detection_stats = {
+            'total_frames': 0,
+            'frames_with_tags': 0,
+            'total_tags_detected': 0,
+            'successful_poses': 0,
+            'failed_poses': 0,
+            'last_detection_time': 0,
+            'tag_detection_counts': {},  # Per-tag detection tracking
+            'detection_rate_history': []  # Add missing field from working calibration
+        }
+        
+        print(f"🔧 Detection confidence threshold: {self.min_detection_confidence}")
+        print(f"🔧 Max reprojection error: {self.max_reproj_error}")
         print(f"🔧 AprilTag Pose Estimator initialized for camera {camera_id}")
     
     def set_camera_resolution(self, width: int, height: int):
@@ -119,6 +146,15 @@ class AprilTagPoseEstimator:
             [0, self.focal_length, height / 2],
             [0, 0, 1]
         ], dtype=np.float32)
+        print(f"📐 Camera matrix updated for resolution {width}x{height}")
+        print(f"   Focal length: {self.focal_length}px")
+        print(f"   Principal point: ({width/2}, {height/2})")
+    
+    def set_horizontal_flip(self, is_flipped: bool):
+        """Set whether the camera feed is horizontally flipped."""
+        self._is_horizontally_flipped = is_flipped
+        print(f"🔄 AprilTag estimator: Horizontal flip {'ENABLED' if is_flipped else 'DISABLED'}")
+        print(f"   This affects camera position calculation relative to AprilTags")
     
     def get_tag_object_points(self, tag_size: float) -> np.ndarray:
         """
@@ -138,7 +174,7 @@ class AprilTagPoseEstimator:
             [-half_size,  half_size, 0]   # Top-left
         ], dtype=np.float32)
     
-    def detect_apriltags(self, frame: np.ndarray):
+    def detect_apriltags(self, frame: np.ndarray) -> List[Dict]:
         """
         Detect AprilTags in frame.
         
@@ -229,8 +265,8 @@ class AprilTagPoseEstimator:
             self.detection_stats['total_tags_detected'] += len(detected_tags)
             self.detection_stats['last_detection_time'] = current_time
         
-        # Log detection summary periodically (every 60 frames to reduce spam)
-        if self.detection_stats['total_frames'] % 60 == 0:  # Every 60 frames
+        # Log detection summary periodically (every 30 frames to match working calibration)
+        if self.detection_stats['total_frames'] % 30 == 0:  # Every 30 frames like working calibration
             self._log_detection_status(detected_tags, rejected_tags, detection_time)
         
         return detected_tags
@@ -280,13 +316,22 @@ class AprilTagPoseEstimator:
         Returns:
             Pose dictionary or None if no tags detected
         """
+        print(f"🔍 DEBUG estimate_pose_from_frame: camera_matrix is None: {self.camera_matrix is None}")
         if self.camera_matrix is None:
+            print(f"❌ DEBUG: Camera matrix is None, cannot estimate pose")
+            self._last_frame_tags = []  # Store empty tags for display
             return None
         
         # Detect AprilTags
+        print(f"🔍 DEBUG: Calling detect_apriltags...")
         detected_tags = self.detect_apriltags(frame)
+        print(f"🔍 DEBUG: Detected {len(detected_tags)} tags: {[tag['id'] for tag in detected_tags]}")
+        
+        # Store detected tags for display reuse
+        self._last_frame_tags = detected_tags
         
         if not detected_tags:
+            print(f"❌ DEBUG: No tags detected, returning None")
             return None
         
         # Use the first detected tag for pose estimation
@@ -295,14 +340,21 @@ class AprilTagPoseEstimator:
         corners = tag['corners']
         tag_info = tag['tag_info']
         
+        print(f"🔍 DEBUG: Using tag {tag_id} for pose estimation")
+        print(f"🔍 DEBUG: Tag corners shape: {corners.shape}")
+        print(f"🔍 DEBUG: Tag world position: {tag_info['position']}")
+        print(f"🔍 DEBUG: Tag size: {tag_info['size']}m")
+        
         # Get tag size and world position
         tag_size = tag_info['size']
         tag_world_pos = tag_info['position']
         
         # Get 3D object points in tag coordinate system
         tag_object_points = self.get_tag_object_points(tag_size)
+        print(f"🔍 DEBUG: Tag object points shape: {tag_object_points.shape}")
         
         try:
+            print(f"🔍 DEBUG: Calling solvePnP...")
             # Solve PnP to get tag pose relative to camera
             success, rvec, tvec = cv2.solvePnP(
                 tag_object_points,
@@ -311,8 +363,13 @@ class AprilTagPoseEstimator:
                 self.dist_coeffs
             )
             
+            print(f"🔍 DEBUG: solvePnP success: {success}")
             if not success:
+                print(f"❌ DEBUG: solvePnP failed")
                 return None
+            
+            print(f"🔍 DEBUG: rvec: {rvec.flatten()}")
+            print(f"🔍 DEBUG: tvec: {tvec.flatten()}")
             
             # Convert rotation vector to rotation matrix
             R_tag_to_cam, _ = cv2.Rodrigues(rvec)
@@ -321,21 +378,40 @@ class AprilTagPoseEstimator:
             # Transform from tag coordinate system to world coordinate system
             # Camera position in tag coordinates
             cam_pos_in_tag = -R_tag_to_cam.T @ t_tag_to_cam
+            print(f"🔍 DEBUG: cam_pos_in_tag: {cam_pos_in_tag}")
+            
+            # IMPORTANT: Account for horizontal flip in camera coordinate system
+            # If the frame is horizontally flipped, we need to mirror the X coordinate
+            # This is because the AprilTag detection was done on the original frame,
+            # but the camera's actual viewing direction is mirrored
+            if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                # Mirror the X component of camera position relative to tag
+                cam_pos_in_tag[0] = -cam_pos_in_tag[0]
+                print(f"🔍 DEBUG: cam_pos_in_tag after flip correction: {cam_pos_in_tag}")
             
             # Camera position in world coordinates
             # For now, assume tag is axis-aligned (no rotation)
             camera_world_pos = tag_world_pos + cam_pos_in_tag
+            print(f"🔍 DEBUG: camera_world_pos: {camera_world_pos}")
             
             # Calculate camera orientation
             # Camera Z-axis in tag coordinates (pointing toward tag)
             cam_z_in_tag = R_tag_to_cam.T @ np.array([0, 0, 1])
             
+            # Account for horizontal flip in orientation calculation
+            if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                # Mirror the X component of camera direction
+                cam_z_in_tag[0] = -cam_z_in_tag[0]
+                print(f"🔍 DEBUG: cam_z_in_tag after flip correction: {cam_z_in_tag}")
+            
             # Project to XY plane and calculate yaw
             yaw_rad = math.atan2(-cam_z_in_tag[1], -cam_z_in_tag[0])
             yaw_deg = math.degrees(yaw_rad)
+            print(f"🔍 DEBUG: yaw_deg: {yaw_deg}")
             
             # Calculate distance to tag
             distance_to_tag = float(np.linalg.norm(t_tag_to_cam))
+            print(f"🔍 DEBUG: distance_to_tag: {distance_to_tag}")
             
             # Estimate FOV based on tag size in image
             tag_pixel_width = np.max(corners[:, 0]) - np.min(corners[:, 0])
@@ -363,10 +439,13 @@ class AprilTagPoseEstimator:
                 'timestamp': time.time()
             }
             
+            print(f"✅ DEBUG: Successfully calculated pose: {pose}")
             return pose
             
         except Exception as e:
-            print(f"AprilTag pose estimation error: {e}")
+            print(f"❌ DEBUG: AprilTag pose estimation error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def get_detection_summary(self) -> Dict[str, Any]:
@@ -475,7 +554,7 @@ class CameraClient:
         
         # Camera pose broadcast (send pose info even without detections)
         self.last_pose_broadcast = 0
-        self.pose_broadcast_interval = 3.0  # Send pose every 3 seconds even without detections
+        self.pose_broadcast_interval = 0.5  # Send pose every 0.5 seconds even without detections
         self.pose_broadcast_count = 0
     
     def test_connection(self):
@@ -511,10 +590,15 @@ class CameraClient:
         if current_time - self.last_apriltag_update < self.apriltag_update_interval:
             return False
         
+        # DEBUG: Always try pose estimation to see what's happening
+        print(f"\n🔍 DEBUG: Attempting AprilTag pose estimation...")
+        
         # Try to estimate pose from AprilTags
         apriltag_pose = self.apriltag_estimator.estimate_pose_from_frame(frame)
         
         if apriltag_pose is not None:
+            print(f"✅ DEBUG: Got AprilTag pose: {apriltag_pose}")
+            
             # Update current pose with AprilTag-based pose
             old_pose = self.pose.copy()
             
@@ -546,11 +630,14 @@ class CameraClient:
             print(f"      Old: {old_pose['yaw_deg']:.1f}°")
             print(f"      New: {self.pose['yaw_deg']:.1f}°")
             print(f"      Change: {yaw_change:.1f}°")
+            print(f"   🔄 COORDINATE SYSTEM:")
+            print(f"      Horizontal flip: {'ENABLED' if self.flip_horizontal else 'DISABLED'}")
+            print(f"      Flip correction applied: {'YES' if hasattr(self.apriltag_estimator, '_is_horizontally_flipped') and self.apriltag_estimator._is_horizontally_flipped else 'NO'}")
             print(f"   🏷️  APRILTAG DETECTION:")
             print(f"      Reference Tag ID: {apriltag_pose['reference_tag_id']}")
             print(f"      Tag Position: {apriltag_pose['reference_tag_pos']}")
             print(f"      Distance to Tag: {apriltag_pose['distance_to_tag']:.3f}m")
-            print(f"      Detection Confidence: {apriltag_pose['confidence']:.3f}")
+            print(f"      Detection Confidence: {apriltag_pose.get('confidence', 'N/A')}")
             print(f"      Reprojection Error: {apriltag_pose.get('reprojection_error', 0):.2f}px")
             print(f"      Estimated FOV: {apriltag_pose['fov_deg']:.1f}°")
             print(f"   📊 DETECTION STATISTICS:")
@@ -562,8 +649,13 @@ class CameraClient:
             print(f"      Updated pose will be sent with next detection packet")
             print(f"      Server: {self.server_addr[0]}:{self.server_addr[1]}")
             
+            # Send immediate pose broadcast to update server with new position
+            self.send_immediate_pose_broadcast()
+            
             return True
         else:
+            print(f"❌ DEBUG: No AprilTag pose detected")
+            
             # Log detection failure periodically
             if self.apriltag_update_count == 0 or (current_time - self.last_apriltag_update) > 10.0:  # Every 10 seconds if no updates
                 detection_summary = self.apriltag_estimator.get_detection_summary()
@@ -731,6 +823,41 @@ class CameraClient:
         
         return success
     
+    def send_immediate_pose_broadcast(self) -> bool:
+        """
+        Send camera pose information immediately (used when pose is updated).
+        This bypasses the normal broadcast interval.
+        
+        Returns:
+            True if packet was sent successfully
+        """
+        current_time = time.time()
+        
+        packet = {
+            "cam_id": self.pose['cam_id'],
+            "pose_broadcast": True,
+            "immediate_update": True,  # Flag to indicate this is an immediate pose update
+            "timestamp": current_time,
+            "pose": {
+                "x": self.pose['x'],
+                "y": self.pose['y'],
+                "yaw_deg": self.pose['yaw_deg'],
+                "fov_deg": self.pose['fov_deg'],
+                "img_w": self.pose['img_w'],
+                "img_h": self.pose['img_h']
+            }
+        }
+        
+        success = udp_send_with_retry(packet, self.server_addr)
+        if success:
+            self.last_pose_broadcast = current_time  # Update broadcast time to avoid spam
+            self.pose_broadcast_count += 1
+            print(f"📡 Sent IMMEDIATE pose broadcast #{self.pose_broadcast_count} for camera {self.pose['cam_id']} at ({self.pose['x']:.3f}, {self.pose['y']:.3f})")
+        else:
+            print(f"❌ Failed to send immediate pose broadcast for camera {self.pose['cam_id']}")
+        
+        return success
+    
     def send_pose_broadcast(self) -> bool:
         """
         Send camera pose information to server even without detections.
@@ -774,6 +901,8 @@ class CameraClient:
         # Initialize AprilTag estimator with actual resolution
         if self.apriltag_estimator is not None:
             self.apriltag_estimator.set_camera_resolution(self.actual_resolution[0], self.actual_resolution[1])
+            # Set horizontal flip flag so pose calculation accounts for mirrored coordinates
+            self.apriltag_estimator.set_horizontal_flip(self.flip_horizontal)
             print(f"🏷️  AprilTag estimator ready with resolution {self.actual_resolution[0]}x{self.actual_resolution[1]}")
         
         frame_count = 0
@@ -801,17 +930,23 @@ class CameraClient:
                 
                 frame_count += 1
                 
-                # Apply horizontal flip if enabled
-                if self.flip_horizontal:
-                    frame = cv2.flip(frame, 1)  # 1 = horizontal flip
+                # Store original frame for AprilTag detection (before flip)
+                original_frame = frame.copy()
                 
-                # Try to update pose from AprilTags (before object detection)
-                apriltag_updated = self.update_pose_from_apriltags(frame)
+                # Try to update pose from AprilTags using ORIGINAL frame (before flip)
+                apriltag_updated = self.update_pose_from_apriltags(original_frame)
                 if apriltag_updated:
                     apriltag_pose_updates += 1
                 
-                # Send regular pose broadcasts to server (even without detections)
-                pose_broadcast_sent = self.send_pose_broadcast()
+                # Apply horizontal flip AFTER AprilTag detection for display and YOLO
+                if self.flip_horizontal:
+                    frame = cv2.flip(frame, 1)  # 1 = horizontal flip
+                
+                # Get AprilTag detection results for display (reuse from pose update if available)
+                detected_tags = []
+                if self.enable_apriltag_pose and self.apriltag_estimator is not None:
+                    # Get the most recent detection results without re-detecting
+                    detected_tags = getattr(self.apriltag_estimator, '_last_frame_tags', [])
                 
                 # Run object detection
                 detections = self.detect_objects(frame)
@@ -854,10 +989,6 @@ class CameraClient:
                 if self.enable_apriltag_pose and self.apriltag_estimator is not None:
                     y_offset = 120
                     
-                    # Get current AprilTag detection status
-                    detected_tags = self.apriltag_estimator.detect_apriltags(frame)
-                    detection_summary = self.apriltag_estimator.get_detection_summary()
-                    
                     # Show AprilTag detection statistics
                     apriltag_text = f"AprilTag Updates: {self.apriltag_update_count} | Last: {time.time() - self.last_apriltag_update:.1f}s ago"
                     cv2.putText(display_frame, apriltag_text,
@@ -865,13 +996,13 @@ class CameraClient:
                     y_offset += 30
                     
                     # Show detection rate and frame processing
-                    detect_rate_text = f"AprilTag Rate: {detection_summary['detection_rate_percent']:.1f}% | Frames: {detection_summary['total_frames']}"
+                    detect_rate_text = f"AprilTag Rate: {self.apriltag_estimator.get_detection_summary()['detection_rate_percent']:.1f}% | Frames: {self.apriltag_estimator.get_detection_summary()['total_frames']}"
                     cv2.putText(display_frame, detect_rate_text,
                                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     y_offset += 25
                     
                     # Show pose success rate
-                    pose_success_text = f"Pose Success: {detection_summary['pose_success_rate_percent']:.1f}% | Total Tags: {detection_summary['total_tags_detected']}"
+                    pose_success_text = f"Pose Success: {self.apriltag_estimator.get_detection_summary()['pose_success_rate_percent']:.1f}% | Total Tags: {self.apriltag_estimator.get_detection_summary()['total_tags_detected']}"
                     cv2.putText(display_frame, pose_success_text,
                                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     y_offset += 25
@@ -905,20 +1036,31 @@ class CameraClient:
                             corners = tag['corners']
                             center = tag['center']
                             
+                            # Transform coordinates for display on flipped frame
+                            display_corners = self.transform_apriltag_coords_for_display(corners, display_frame.shape[1])
+                            display_center = self.transform_apriltag_coords_for_display(center, display_frame.shape[1])
+                            
+                            # Debug: Show coordinate transformation
+                            if frame_count % 30 == 0:  # Every 30 frames to avoid spam
+                                print(f"🔄 DEBUG Tag {tag_id} coordinate transform:")
+                                print(f"   Original center: ({center[0]:.1f}, {center[1]:.1f})")
+                                print(f"   Display center: ({display_center[0]:.1f}, {display_center[1]:.1f})")
+                                print(f"   Frame width: {display_frame.shape[1]}, Flip enabled: {self.flip_horizontal}")
+                            
                             # Draw tag corners and outline
-                            corners_int = corners.astype(int)
+                            corners_int = display_corners.astype(int)
                             cv2.polylines(display_frame, [corners_int], True, (0, 255, 0), 2)
                             
                             # Draw tag ID and confidence at center
                             cv2.putText(display_frame, f"ID:{tag_id}", 
-                                       (int(center[0]) - 30, int(center[1]) - 15),
+                                       (int(display_center[0]) - 30, int(display_center[1]) - 15),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                             cv2.putText(display_frame, f"C:{confidence:.2f}", 
-                                       (int(center[0]) - 30, int(center[1])),
+                                       (int(display_center[0]) - 30, int(display_center[1])),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                             
                             # Draw center point
-                            cv2.circle(display_frame, (int(center[0]), int(center[1])), 5, (0, 0, 255), -1)
+                            cv2.circle(display_frame, (int(display_center[0]), int(display_center[1])), 5, (0, 0, 255), -1)
                     else:
                         no_tags_text = "Current Frame: No AprilTags detected"
                         cv2.putText(display_frame, no_tags_text,
@@ -926,13 +1068,13 @@ class CameraClient:
                         y_offset += 25
                     
                     # Show per-tag detection history
-                    if detection_summary['tag_detection_counts']:
+                    if self.apriltag_estimator.get_detection_summary()['tag_detection_counts']:
                         history_text = "Tag History:"
                         cv2.putText(display_frame, history_text,
                                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                         y_offset += 20
                         
-                        for tag_id, counts in detection_summary['tag_detection_counts'].items():
+                        for tag_id, counts in self.apriltag_estimator.get_detection_summary()['tag_detection_counts'].items():
                             success_rate = (counts['accepted'] / counts['seen']) * 100 if counts['seen'] > 0 else 0
                             tag_history = f"  Tag {tag_id}: {counts['accepted']}/{counts['seen']} ({success_rate:.1f}%)"
                             cv2.putText(display_frame, tag_history,
@@ -990,6 +1132,36 @@ class CameraClient:
             
             self.cap.release()
             cv2.destroyAllWindows()
+
+    def transform_apriltag_coords_for_display(self, coords, frame_width):
+        """
+        Transform AprilTag coordinates from original frame to flipped display frame.
+        
+        Args:
+            coords: Coordinates from original frame (before flip)
+            frame_width: Width of the frame
+            
+        Returns:
+            Transformed coordinates for display on flipped frame
+        """
+        if not self.flip_horizontal:
+            return coords
+        
+        # For horizontal flip, mirror X coordinates
+        if isinstance(coords, tuple):
+            # Single point (x, y)
+            return (frame_width - coords[0], coords[1])
+        elif isinstance(coords, np.ndarray) and coords.shape == (4, 2):
+            # AprilTag corners array
+            transformed = coords.copy()
+            transformed[:, 0] = frame_width - coords[:, 0]
+            return transformed
+        else:
+            # Generic array of points
+            transformed = coords.copy()
+            if len(transformed.shape) == 2 and transformed.shape[1] >= 1:
+                transformed[:, 0] = frame_width - coords[:, 0]
+            return transformed
 
 
 async def main():

@@ -33,6 +33,10 @@ class FusionServer:
         # Camera poses will be learned dynamically from client packets
         self.poses = {}
         
+        # Load AprilTag positions from config
+        self.apriltags = {}
+        self.load_apriltag_config()
+        
         # Track when each camera was last seen
         self.camera_last_seen = {}
         self.camera_timeout = 1.0  # Remove cameras after 1 second of no data
@@ -70,14 +74,45 @@ class FusionServer:
         # Setup matplotlib for live plotting
         self.setup_plot()
     
+    def load_apriltag_config(self):
+        """Load AprilTag positions from config file."""
+        try:
+            with open('apriltag_config.json', 'r') as f:
+                config = json.load(f)
+            
+            for tag in config['apriltags']:
+                tag_id = tag['id']
+                self.apriltags[tag_id] = {
+                    'x': tag['x'],
+                    'y': tag['y'],
+                    'z': tag['z'],
+                    'size': tag.get('size', config.get('default_size', 0.1)),
+                    'orientation': tag.get('orientation', 'horizontal'),
+                    'description': tag.get('description', f"Tag {tag_id}")
+                }
+            
+            print(f"📍 Loaded {len(self.apriltags)} AprilTags from config:")
+            for tag_id, tag_info in self.apriltags.items():
+                print(f"   Tag {tag_id}: ({tag_info['x']}, {tag_info['y']}) - {tag_info['orientation']}")
+                
+        except FileNotFoundError:
+            print("⚠️  No apriltag_config.json found - AprilTags will not be displayed")
+            self.apriltags = {}
+        except Exception as e:
+            print(f"❌ Error loading AprilTag config: {e}")
+            self.apriltags = {}
+    
     def setup_plot(self):
         """Initialize matplotlib figure for real-time position plotting."""
         plt.ion()  # Enable interactive mode
-        self.fig, self.ax = plt.subplots(figsize=(8, 6))
+        self.fig, self.ax = plt.subplots(figsize=(10, 8))
         self.ax.set_xlabel('X (meters)')
         self.ax.set_ylabel('Y (meters)')
-        self.ax.set_title('Object Position Triangulation')
+        self.ax.set_title('Multi-Camera Object Triangulation with AprilTags')
         self.ax.grid(True)
+        
+        # Draw AprilTags on the plot
+        self.draw_apriltags()
         
         # Don't plot any cameras initially - they will appear when clients connect
         # and start sending data
@@ -85,9 +120,25 @@ class FusionServer:
         # Initialize empty scatter plot for object positions
         self.scatter = self.ax.scatter([], [], c='blue', s=100, alpha=1.0, zorder=5, edgecolors='black', linewidth=1)
         
-        # Set initial axis limits
-        self.ax.set_xlim(-5, 5)
-        self.ax.set_ylim(-5, 5)
+        # Set expanded axis limits to show AprilTags and expected camera positions
+        # Calculate bounds based on AprilTags and expected camera range
+        if self.apriltags:
+            tag_x_coords = [tag['x'] for tag in self.apriltags.values()]
+            tag_y_coords = [tag['y'] for tag in self.apriltags.values()]
+            
+            # Expand bounds to include expected camera positions
+            x_min = min(tag_x_coords) - 3.0  # 3m margin for cameras
+            x_max = max(tag_x_coords) + 3.0
+            y_min = min(tag_y_coords) - 1.0  # 1m behind wall
+            y_max = max(tag_y_coords) + 5.0  # 5m in front of wall for cameras
+            
+            self.ax.set_xlim(x_min, x_max)
+            self.ax.set_ylim(y_min, y_max)
+        else:
+            # Default expanded view if no AprilTags
+            self.ax.set_xlim(-5, 5)
+            self.ax.set_ylim(-2, 8)
+        
         self.ax.legend()
         
         # Try to bring window to front (backend-agnostic)
@@ -111,6 +162,61 @@ class FusionServer:
         
         self.fig.canvas.draw()
         plt.show(block=False)
+    
+    def draw_apriltags(self):
+        """Draw AprilTag positions on the plot."""
+        if not self.apriltags:
+            return
+        
+        for tag_id, tag_info in self.apriltags.items():
+            x, y = tag_info['x'], tag_info['y']
+            orientation = tag_info['orientation']
+            size = tag_info['size']
+            
+            # Choose marker style based on orientation
+            if orientation == 'wall_mounted':
+                # Wall-mounted tags - draw as squares with orientation indicator
+                marker = 's'  # square
+                color = 'black'
+                markersize = 15
+                
+                # Draw the tag
+                self.ax.plot(x, y, marker, color=color, markersize=markersize, 
+                           markeredgecolor='white', markeredgewidth=2, zorder=8,
+                           label=f'AprilTag {tag_id}' if tag_id == list(self.apriltags.keys())[0] else "")
+                
+                # Add tag ID label
+                self.ax.text(x, y + 0.2, f'T{tag_id}', ha='center', va='bottom', 
+                           fontsize=10, fontweight='bold', color='black',
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='yellow', alpha=0.8),
+                           zorder=9)
+                
+                # Draw wall line (assuming tags are on north wall facing south)
+                wall_length = 0.5
+                wall_x = [x - wall_length/2, x + wall_length/2]
+                wall_y = [y - 0.1, y - 0.1]  # Wall slightly behind tag
+                self.ax.plot(wall_x, wall_y, 'k-', linewidth=4, alpha=0.7, zorder=7)
+                
+                # Draw normal vector (facing direction)
+                normal_length = 0.3
+                self.ax.arrow(x, y, 0, normal_length, head_width=0.05, head_length=0.05, 
+                            fc='red', ec='red', alpha=0.8, zorder=8)
+                
+            else:
+                # Horizontal tags - draw as circles
+                marker = 'o'
+                color = 'purple'
+                markersize = 12
+                
+                self.ax.plot(x, y, marker, color=color, markersize=markersize, 
+                           markeredgecolor='white', markeredgewidth=2, zorder=8,
+                           label=f'AprilTag {tag_id}' if tag_id == list(self.apriltags.keys())[0] else "")
+                
+                # Add tag ID label
+                self.ax.text(x + 0.2, y + 0.2, f'T{tag_id}', ha='left', va='bottom', 
+                           fontsize=10, fontweight='bold', color='purple',
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8),
+                           zorder=9)
     
     def draw_camera_fov(self, pose: dict, cam_id: str):
         """
@@ -540,9 +646,13 @@ class FusionServer:
                     cam_x_coords = [pose['x'] for pose in self.poses.values()]
                     cam_y_coords = [pose['y'] for pose in self.poses.values()]
                     
-                    # Combine object and camera coordinates for axis limits
-                    all_x = x_coords + cam_x_coords
-                    all_y = y_coords + cam_y_coords
+                    # Get AprilTag positions
+                    tag_x_coords = [tag['x'] for tag in self.apriltags.values()]
+                    tag_y_coords = [tag['y'] for tag in self.apriltags.values()]
+                    
+                    # Combine object, camera, and AprilTag coordinates for axis limits
+                    all_x = x_coords + cam_x_coords + tag_x_coords
+                    all_y = y_coords + cam_y_coords + tag_y_coords
                     
                     margin = 1.0
                     x_min, x_max = min(all_x) - margin, max(all_x) + margin
@@ -639,10 +749,13 @@ class FusionServer:
         # Restore plot settings
         self.ax.set_xlabel('X (meters)')
         self.ax.set_ylabel('Y (meters)')
-        self.ax.set_title('Object Position Triangulation')
+        self.ax.set_title('Multi-Camera Object Triangulation with AprilTags')
         self.ax.grid(True)
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
+        
+        # Redraw AprilTags first (so they appear behind cameras)
+        self.draw_apriltags()
         
         # Recreate the scatter plot for object positions
         self.scatter = self.ax.scatter([], [], c='blue', s=100, alpha=1.0, zorder=5, edgecolors='black', linewidth=1)
@@ -660,7 +773,7 @@ class FusionServer:
         # Update legend
         self.ax.legend()
         
-        print(f"Redrawn plot with {active_count} active cameras (out of {len(self.poses)} total)")
+        print(f"Redrawn plot with {active_count} active cameras (out of {len(self.poses)} total) and {len(self.apriltags)} AprilTags")
     
     async def run_server(self):
         """Main server loop receiving UDP packets and processing detections."""

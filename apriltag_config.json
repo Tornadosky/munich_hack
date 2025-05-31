@@ -4,17 +4,23 @@
             "id": 1,
             "x": 1.0,
             "y": 0.0,
-            "z": 0.0,
+            "z": 1.0,
             "size": 0.157,
-            "description": "AprilTag at position (1, 0)"
+            "description": "AprilTag 1 on wall",
+            "orientation": "wall_mounted",
+            "wall_normal": [0, 1, 0],
+            "wall_direction": "north"
         },
         {
             "id": 2,
             "x": -1.0,
             "y": 0.0,
-            "z": 0.0,
+            "z": 1.0,
             "size": 0.157,
-            "description": "AprilTag at position (-1, 0)"
+            "description": "AprilTag 2 on wall",
+            "orientation": "wall_mounted",
+            "wall_normal": [0, 1, 0],
+            "wall_direction": "north"
         }
     ],
     "tag_family": "tag36h11",
@@ -25,6 +31,7 @@
     },
     "pose_estimation": {
         "max_reproj_error": 5.0,
-        "min_detection_confidence": 0.3
+        "min_detection_confidence": 0.3,
+        "use_2d_positioning": true
     }
 } 

@@ -84,13 +84,17 @@ class AprilTagPoseEstimator:
             self.tag_positions[tag_id] = {
                 'position': np.array([tag['x'], tag['y'], tag['z']], dtype=np.float32),
                 'size': tag.get('size', self.config['default_size']),
-                'description': tag.get('description', f"Tag {tag_id}")
+                'description': tag.get('description', f"Tag {tag_id}"),
+                'orientation': tag.get('orientation', 'horizontal'),
+                'wall_normal': tag.get('wall_normal', [0, 1, 0]),
+                'wall_direction': tag.get('wall_direction', 'north')
             }
         
         print(f"📍 Available AprilTags:")
         for tag_id, info in self.tag_positions.items():
             pos = info['position']
-            print(f"   Tag {tag_id}: ({pos[0]}, {pos[1]}, {pos[2]}) - size: {info['size']}m")
+            orientation = info['orientation']
+            print(f"   Tag {tag_id}: ({pos[0]}, {pos[1]}, {pos[2]}) - size: {info['size']}m - orientation: {orientation.upper()}")
         
         # Camera intrinsic parameters (will be updated when resolution is known)
         self.focal_length = self.config['camera_intrinsics']['focal_length']
@@ -156,23 +160,39 @@ class AprilTagPoseEstimator:
         print(f"🔄 AprilTag estimator: Horizontal flip {'ENABLED' if is_flipped else 'DISABLED'}")
         print(f"   This affects camera position calculation relative to AprilTags")
     
-    def get_tag_object_points(self, tag_size: float) -> np.ndarray:
+    def get_tag_object_points(self, tag_size: float, tag_info: dict) -> np.ndarray:
         """
         Get 3D object points for an AprilTag in tag coordinate system.
         
         Args:
             tag_size: Size of the tag in meters
+            tag_info: Tag information including orientation
             
         Returns:
             4x3 array of object points
         """
         half_size = tag_size / 2.0
-        return np.array([
-            [-half_size, -half_size, 0],  # Bottom-left
-            [ half_size, -half_size, 0],  # Bottom-right
-            [ half_size,  half_size, 0],  # Top-right
-            [-half_size,  half_size, 0]   # Top-left
-        ], dtype=np.float32)
+        
+        # Get tag orientation
+        orientation = tag_info.get('orientation', 'horizontal')
+        
+        if orientation == 'wall_mounted':
+            # Wall-mounted tag - simplified for 2D positioning
+            # Tag is vertical on wall, facing outward (toward cameras)
+            return np.array([
+                [-half_size, 0, -half_size],  # Bottom-left
+                [ half_size, 0, -half_size],  # Bottom-right
+                [ half_size, 0,  half_size],  # Top-right
+                [-half_size, 0,  half_size]   # Top-left
+            ], dtype=np.float32)
+        else:
+            # Horizontal tag (on floor) - original
+            return np.array([
+                [-half_size, -half_size, 0],  # Bottom-left
+                [ half_size, -half_size, 0],  # Bottom-right
+                [ half_size,  half_size, 0],  # Top-right
+                [-half_size,  half_size, 0]   # Top-left
+            ], dtype=np.float32)
     
     def detect_apriltags(self, frame: np.ndarray) -> List[Dict]:
         """
@@ -345,12 +365,56 @@ class AprilTagPoseEstimator:
         print(f"🔍 DEBUG: Tag world position: {tag_info['position']}")
         print(f"🔍 DEBUG: Tag size: {tag_info['size']}m")
         
+        # Get tag orientation
+        orientation = tag_info.get('orientation', 'horizontal')
+        print(f"🔍 DEBUG: Tag orientation: {orientation.upper()}")
+        
+        if orientation == 'wall_mounted':
+            print(f"🔍 DEBUG: Using simplified 2D positioning for wall-mounted tag")
+            
+            # Use simplified 2D positioning for wall-mounted tags
+            pos_2d = self.estimate_2d_camera_position(tag_info, corners, frame.shape)
+            if pos_2d is None:
+                print(f"❌ DEBUG: 2D positioning failed")
+                return None
+            
+            # Create pose result
+            pose = {
+                'cam_id': self.camera_id,
+                'x': float(pos_2d['x']),
+                'y': float(pos_2d['y']),
+                'z': float(pos_2d['z']),
+                'yaw_deg': float(pos_2d['yaw_deg']),
+                'fov_deg': 70.0,  # Default FOV
+                'img_w': frame.shape[1],
+                'img_h': frame.shape[0],
+                'distance_to_tag': float(pos_2d['distance_to_tag']),
+                'reference_tag_id': tag_id,
+                'reference_tag_pos': tag_info['position'].tolist(),
+                'reference_tag_orientation': orientation.upper(),
+                'calibration_method': 'apriltag_2d_simplified',
+                'horizontal_offset': float(pos_2d['horizontal_offset']),
+                'timestamp': time.time()
+            }
+            
+            print(f"✅ DEBUG: 2D positioning successful: {pose}")
+            return pose
+            
+        else:
+            print(f"🔍 DEBUG: Using 3D solvePnP for {orientation} tag")
+        
+        # Continue with original 3D approach for non-wall-mounted tags
+        if orientation == 'vertical':
+            print(f"🔍 DEBUG: Vertical tag mounted on wall at position {tag_info['position']}")
+        else:
+            print(f"🔍 DEBUG: Horizontal tag lying flat on floor at Z={tag_info['position'][2]}")
+        
         # Get tag size and world position
         tag_size = tag_info['size']
         tag_world_pos = tag_info['position']
         
         # Get 3D object points in tag coordinate system
-        tag_object_points = self.get_tag_object_points(tag_size)
+        tag_object_points = self.get_tag_object_points(tag_size, tag_info)
         print(f"🔍 DEBUG: Tag object points shape: {tag_object_points.shape}")
         
         try:
@@ -376,48 +440,150 @@ class AprilTagPoseEstimator:
             t_tag_to_cam = tvec.flatten()
             
             # Transform from tag coordinate system to world coordinate system
+            # Handle both VERTICAL tags (on walls) and HORIZONTAL tags (on floor)
+            
             # Camera position in tag coordinates
             cam_pos_in_tag = -R_tag_to_cam.T @ t_tag_to_cam
-            print(f"🔍 DEBUG: cam_pos_in_tag: {cam_pos_in_tag}")
+            print(f"🔍 DEBUG: cam_pos_in_tag (raw): {cam_pos_in_tag}")
             
-            # IMPORTANT: Account for horizontal flip in camera coordinate system
-            # If the frame is horizontally flipped, we need to mirror the X coordinate
-            # This is because the AprilTag detection was done on the original frame,
-            # but the camera's actual viewing direction is mirrored
-            if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
-                # Mirror the X component of camera position relative to tag
-                cam_pos_in_tag[0] = -cam_pos_in_tag[0]
-                print(f"🔍 DEBUG: cam_pos_in_tag after flip correction: {cam_pos_in_tag}")
+            # Get tag orientation
+            orientation = tag_info.get('orientation', 'horizontal')
             
-            # Camera position in world coordinates
-            # For now, assume tag is axis-aligned (no rotation)
-            camera_world_pos = tag_world_pos + cam_pos_in_tag
+            if orientation == 'vertical':
+                # VERTICAL TAG (mounted on wall)
+                # Tag coordinate system: X=horizontal, Y=depth from wall, Z=vertical
+                # World coordinate system: X=world X, Y=world Y, Z=height
+                
+                # For vertical tags, we need to transform based on which wall they're on
+                normal_vector = tag_info.get('normal_vector', [0, 1, 0])  # Default facing +Y
+                rotation_z = tag_info.get('rotation_z', 0.0)  # Rotation around Z axis
+                
+                print(f"🔍 DEBUG: Vertical tag normal vector: {normal_vector}, rotation_z: {rotation_z}°")
+                
+                # Camera offset from tag in tag coordinates
+                camera_offset_x = cam_pos_in_tag[0]  # Horizontal offset along wall
+                camera_distance_from_wall = cam_pos_in_tag[1]  # Distance from wall (depth)
+                camera_height = cam_pos_in_tag[2]  # Height relative to tag center
+                
+                print(f"🔍 DEBUG: Camera relative to vertical tag: X={camera_offset_x:.3f}m, Distance={camera_distance_from_wall:.3f}m, Height={camera_height:.3f}m")
+                
+                # Apply horizontal flip correction
+                if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                    camera_offset_x = -camera_offset_x
+                    print(f"🔍 DEBUG: Camera offset after flip correction: X={camera_offset_x:.3f}m")
+                
+                # Transform to world coordinates based on tag orientation
+                if rotation_z == 0.0:  # Tag facing +Y (north)
+                    camera_world_x = tag_world_pos[0] + camera_offset_x
+                    camera_world_y = tag_world_pos[1] + camera_distance_from_wall
+                elif rotation_z == 180.0:  # Tag facing -Y (south)
+                    camera_world_x = tag_world_pos[0] - camera_offset_x
+                    camera_world_y = tag_world_pos[1] - camera_distance_from_wall
+                elif rotation_z == 90.0:  # Tag facing +X (east)
+                    camera_world_x = tag_world_pos[0] + camera_distance_from_wall
+                    camera_world_y = tag_world_pos[1] - camera_offset_x
+                elif rotation_z == 270.0:  # Tag facing -X (west)
+                    camera_world_x = tag_world_pos[0] - camera_distance_from_wall
+                    camera_world_y = tag_world_pos[1] + camera_offset_x
+                else:
+                    # Generic rotation - use rotation matrix
+                    angle_rad = math.radians(rotation_z)
+                    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+                    camera_world_x = tag_world_pos[0] + camera_offset_x * cos_a + camera_distance_from_wall * sin_a
+                    camera_world_y = tag_world_pos[1] - camera_offset_x * sin_a + camera_distance_from_wall * cos_a
+                
+                camera_world_z = tag_world_pos[2] + camera_height
+                
+                # Calculate camera yaw for vertical tag
+                # Camera looking direction in tag coordinates
+                cam_z_in_tag = R_tag_to_cam.T @ np.array([0, 0, 1])
+                
+                # Apply flip correction to viewing direction
+                if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                    cam_z_in_tag[0] = -cam_z_in_tag[0]
+                
+                # Transform viewing direction to world coordinates
+                if rotation_z == 0.0:  # Tag facing +Y
+                    world_view_x = cam_z_in_tag[0]
+                    world_view_y = cam_z_in_tag[1]
+                elif rotation_z == 180.0:  # Tag facing -Y
+                    world_view_x = -cam_z_in_tag[0]
+                    world_view_y = -cam_z_in_tag[1]
+                elif rotation_z == 90.0:  # Tag facing +X
+                    world_view_x = cam_z_in_tag[1]
+                    world_view_y = -cam_z_in_tag[0]
+                elif rotation_z == 270.0:  # Tag facing -X
+                    world_view_x = -cam_z_in_tag[1]
+                    world_view_y = cam_z_in_tag[0]
+                else:
+                    # Generic rotation
+                    angle_rad = math.radians(rotation_z)
+                    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+                    world_view_x = cam_z_in_tag[0] * cos_a + cam_z_in_tag[1] * sin_a
+                    world_view_y = -cam_z_in_tag[0] * sin_a + cam_z_in_tag[1] * cos_a
+                
+                yaw_rad = math.atan2(world_view_y, world_view_x)
+                yaw_deg = math.degrees(yaw_rad)
+                
+            else:
+                # HORIZONTAL TAG (on floor) - fix coordinate transformation
+                camera_height_above_tag = cam_pos_in_tag[2]
+                camera_offset_x = cam_pos_in_tag[0]
+                camera_offset_y = cam_pos_in_tag[1]
+                
+                print(f"🔍 DEBUG: Camera relative to horizontal tag: X={camera_offset_x:.3f}m, Y={camera_offset_y:.3f}m, Height={camera_height_above_tag:.3f}m")
+                
+                # Apply horizontal flip correction
+                if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                    camera_offset_x = -camera_offset_x
+                    print(f"🔍 DEBUG: Camera offset after flip correction: X={camera_offset_x:.3f}m")
+                
+                # CRITICAL FIX: For horizontal tags, the coordinate transformation needs to account for
+                # the fact that the camera is looking DOWN at the tag, not AT the tag
+                # The tag's coordinate system has Z pointing up, but we need world coordinates
+                
+                # Transform camera position to world coordinates
+                # For a horizontal tag lying flat: tag X,Y are world X,Y, tag Z is height
+                camera_world_x = tag_world_pos[0] + camera_offset_x
+                camera_world_y = tag_world_pos[1] + camera_offset_y  
+                camera_world_z = tag_world_pos[2] + camera_height_above_tag
+                
+                print(f"🔍 DEBUG: World position calculation:")
+                print(f"   Tag world pos: ({tag_world_pos[0]}, {tag_world_pos[1]}, {tag_world_pos[2]})")
+                print(f"   Camera offset: ({camera_offset_x:.3f}, {camera_offset_y:.3f}, {camera_height_above_tag:.3f})")
+                print(f"   Result: ({camera_world_x:.3f}, {camera_world_y:.3f}, {camera_world_z:.3f})")
+                
+                # Calculate camera yaw for horizontal tag
+                # Camera looking direction in tag coordinates
+                cam_z_in_tag = R_tag_to_cam.T @ np.array([0, 0, 1])
+                print(f"🔍 DEBUG: Camera Z direction in tag coords: {cam_z_in_tag}")
+                
+                # Apply flip correction to viewing direction
+                if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                    cam_z_in_tag[0] = -cam_z_in_tag[0]
+                    print(f"🔍 DEBUG: Camera Z direction after flip: {cam_z_in_tag}")
+                
+                # For horizontal tags, calculate yaw from horizontal components
+                # The camera is looking down, so we project the viewing direction onto XY plane
+                yaw_rad = math.atan2(cam_z_in_tag[1], cam_z_in_tag[0])
+                yaw_deg = math.degrees(yaw_rad)
+                
+                # Normalize yaw to 0-360 range
+                if yaw_deg < 0:
+                    yaw_deg += 360
+                
+                print(f"🔍 DEBUG: Calculated yaw: {yaw_deg:.1f}°")
+            
+            # Final camera position in world coordinates
+            camera_world_pos = np.array([camera_world_x, camera_world_y, camera_world_z])
             print(f"🔍 DEBUG: camera_world_pos: {camera_world_pos}")
-            
-            # Calculate camera orientation
-            # Camera Z-axis in tag coordinates (pointing toward tag)
-            cam_z_in_tag = R_tag_to_cam.T @ np.array([0, 0, 1])
-            
-            # Account for horizontal flip in orientation calculation
-            if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
-                # Mirror the X component of camera direction
-                cam_z_in_tag[0] = -cam_z_in_tag[0]
-                print(f"🔍 DEBUG: cam_z_in_tag after flip correction: {cam_z_in_tag}")
-            
-            # Project to XY plane and calculate yaw
-            yaw_rad = math.atan2(-cam_z_in_tag[1], -cam_z_in_tag[0])
-            yaw_deg = math.degrees(yaw_rad)
-            print(f"🔍 DEBUG: yaw_deg: {yaw_deg}")
-            
-            # Calculate distance to tag
-            distance_to_tag = float(np.linalg.norm(t_tag_to_cam))
-            print(f"🔍 DEBUG: distance_to_tag: {distance_to_tag}")
+            print(f"🔍 DEBUG: yaw_deg (for {orientation} tag): {yaw_deg}")
             
             # Estimate FOV based on tag size in image
             tag_pixel_width = np.max(corners[:, 0]) - np.min(corners[:, 0])
             
-            if distance_to_tag > 0 and tag_pixel_width > 0:
-                tag_angular_width = 2 * math.atan(tag_size / (2 * distance_to_tag))
+            if camera_world_z > 0 and tag_pixel_width > 0:
+                tag_angular_width = 2 * math.atan(tag_size / (2 * camera_world_z))
                 estimated_fov = math.degrees(tag_angular_width) * (frame.shape[1] / tag_pixel_width)
                 estimated_fov = max(30.0, min(120.0, estimated_fov))
             else:
@@ -432,9 +598,10 @@ class AprilTagPoseEstimator:
                 'fov_deg': float(estimated_fov),
                 'img_w': frame.shape[1],
                 'img_h': frame.shape[0],
-                'distance_to_tag': distance_to_tag,
+                'distance_to_tag': float(np.linalg.norm(tvec)),
                 'reference_tag_id': tag_id,
                 'reference_tag_pos': tag_world_pos.tolist(),
+                'reference_tag_orientation': orientation.upper(),
                 'calibration_method': 'apriltag_realtime',
                 'timestamp': time.time()
             }
@@ -464,6 +631,95 @@ class AprilTagPoseEstimator:
             'tag_detection_counts': stats['tag_detection_counts'].copy(),
             'last_detection_ago_seconds': time.time() - stats['last_detection_time'] if stats['last_detection_time'] > 0 else None
         }
+
+    def estimate_2d_camera_position(self, tag_info: dict, corners: np.ndarray, frame_shape: tuple) -> Optional[Dict[str, float]]:
+        """
+        Simplified 2D camera position estimation for wall-mounted tags.
+        
+        Args:
+            tag_info: Tag information
+            corners: Detected tag corners in image
+            frame_shape: (height, width) of the frame
+            
+        Returns:
+            2D position dict or None
+        """
+        try:
+            # Get tag world position (2D)
+            tag_world_x = tag_info['position'][0]
+            tag_world_y = tag_info['position'][1]
+            tag_size = tag_info['size']
+            
+            print(f"🔍 2D DEBUG: Tag world position: ({tag_world_x}, {tag_world_y})")
+            print(f"🔍 2D DEBUG: Tag size: {tag_size}m")
+            
+            # Calculate tag center and size in image
+            tag_center_x = np.mean(corners[:, 0])
+            tag_center_y = np.mean(corners[:, 1])
+            tag_width_pixels = np.max(corners[:, 0]) - np.min(corners[:, 0])
+            tag_height_pixels = np.max(corners[:, 1]) - np.min(corners[:, 1])
+            
+            print(f"🔍 2D DEBUG: Tag in image - center: ({tag_center_x:.1f}, {tag_center_y:.1f}), size: {tag_width_pixels:.1f}x{tag_height_pixels:.1f}px")
+            
+            # Estimate distance to tag based on apparent size
+            # Assuming focal length from config
+            focal_length = self.focal_length
+            estimated_distance = (tag_size * focal_length) / tag_width_pixels
+            
+            print(f"🔍 2D DEBUG: Estimated distance to tag: {estimated_distance:.3f}m")
+            
+            # Calculate horizontal offset from tag center
+            frame_center_x = frame_shape[1] / 2
+            pixel_offset_x = tag_center_x - frame_center_x
+            
+            # Convert pixel offset to world offset (simplified)
+            # This is an approximation - more accurate with proper camera calibration
+            horizontal_fov_rad = math.radians(70)  # Assume 70° FOV
+            pixels_per_radian = frame_shape[1] / horizontal_fov_rad
+            angle_offset_rad = pixel_offset_x / pixels_per_radian
+            
+            # Calculate camera position relative to tag
+            horizontal_offset = estimated_distance * math.tan(angle_offset_rad)
+            
+            print(f"🔍 2D DEBUG: Horizontal offset from tag: {horizontal_offset:.3f}m")
+            
+            # Apply horizontal flip correction
+            if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
+                horizontal_offset = -horizontal_offset
+                print(f"🔍 2D DEBUG: Horizontal offset after flip correction: {horizontal_offset:.3f}m")
+            
+            # Calculate camera world position (2D)
+            # For wall-mounted tags facing north (positive Y direction)
+            camera_world_x = tag_world_x + horizontal_offset
+            camera_world_y = tag_world_y + estimated_distance  # Camera is in front of wall
+            
+            print(f"🔍 2D DEBUG: Camera 2D position: ({camera_world_x:.3f}, {camera_world_y:.3f})")
+            
+            # Calculate camera yaw (simplified)
+            # Camera is looking toward the wall (negative Y direction)
+            yaw_deg = 270.0  # Facing north wall
+            if horizontal_offset != 0:
+                # Adjust yaw based on horizontal offset
+                yaw_adjustment = math.degrees(math.atan(horizontal_offset / estimated_distance))
+                yaw_deg += yaw_adjustment
+            
+            # Normalize yaw
+            yaw_deg = yaw_deg % 360
+            
+            print(f"🔍 2D DEBUG: Camera yaw: {yaw_deg:.1f}°")
+            
+            return {
+                'x': camera_world_x,
+                'y': camera_world_y,
+                'z': 1.5,  # Assume camera height
+                'yaw_deg': yaw_deg,
+                'distance_to_tag': estimated_distance,
+                'horizontal_offset': horizontal_offset
+            }
+            
+        except Exception as e:
+            print(f"❌ 2D positioning error: {e}")
+            return None
 
 
 class CameraClient:
@@ -633,6 +889,9 @@ class CameraClient:
             print(f"   🔄 COORDINATE SYSTEM:")
             print(f"      Horizontal flip: {'ENABLED' if self.flip_horizontal else 'DISABLED'}")
             print(f"      Flip correction applied: {'YES' if hasattr(self.apriltag_estimator, '_is_horizontally_flipped') and self.apriltag_estimator._is_horizontally_flipped else 'NO'}")
+            tag_orientation = apriltag_pose.get('reference_tag_orientation', 'UNKNOWN')
+            print(f"      Tag orientation: {tag_orientation}")
+            print(f"      Camera height above floor: {apriltag_pose.get('z', 0):.3f}m")
             print(f"   🏷️  APRILTAG DETECTION:")
             print(f"      Reference Tag ID: {apriltag_pose['reference_tag_id']}")
             print(f"      Tag Position: {apriltag_pose['reference_tag_pos']}")

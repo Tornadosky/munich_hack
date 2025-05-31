@@ -55,9 +55,17 @@ class CameraClient:
     
     def start_capture(self):
         """Initialize webcam capture."""
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            raise RuntimeError("Cannot open webcam")
+        # Try to find a working camera
+        for camera_id in range(5):
+            self.cap = cv2.VideoCapture(camera_id)
+            if self.cap.isOpened():
+                ret, _ = self.cap.read()
+                if ret:
+                    print(f"Using camera {camera_id}")
+                    break
+                self.cap.release()
+        else:
+            raise RuntimeError("Cannot find any working webcam")
         
         # Set capture resolution to match pose config
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.pose['img_w'])

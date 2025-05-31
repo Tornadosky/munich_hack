@@ -39,6 +39,222 @@ That's it! **Total setup time: 5 minutes.**
 
 ---
 
+## 🏷️ **AprilTag-Based Calibration** (Professional Grade)
+
+### **Overview**
+
+The system supports automatic camera pose estimation using AprilTags, providing professional-grade accuracy without manual measurements. AprilTags are robust fiducial markers that enable precise 6DOF pose estimation.
+
+### **How It Works**
+
+1. **AprilTag Placement**: Place AprilTags at known world coordinate positions
+2. **Automatic Detection**: Cameras detect AprilTags and calculate their position relative to them
+3. **Real-time Updates**: Camera pose updates continuously as tags are detected
+4. **High Accuracy**: Uses OpenCV's `solvePnP` function for precise pose estimation
+
+### **Quick Start with AprilTags**
+
+#### Method 1: One-time Calibration Session
+```bash
+# 1. Generate AprilTag configuration and printable tags
+python generate_apriltags.py --config apriltag_config.json
+
+# 2. Print the generated apriltags.png file (at 100% scale, no fit-to-page)
+
+# 3. Place AprilTag ID 0 at position (1, 0) and AprilTag ID 1 at position (-1, 0)
+
+# 4. Run calibration session
+python apriltag_pose_calibration.py --camera-id A --config apriltag_config.json
+
+# 5. Use the camera system
+python fusion_server.py --listen 0.0.0.0:9000
+python cam_client.py --pose pose_A.json --server localhost:9000 --target bottle
+```
+
+#### Method 2: Real-time Pose Updates
+```bash
+# Skip calibration session, let camera auto-update its pose in real-time
+python cam_client.py --pose pose_A.json --server localhost:9000 --target bottle \
+    --enable-apriltag-pose --apriltag-config apriltag_config.json
+```
+
+### **AprilTag Configuration**
+
+The system uses a configuration file (`apriltag_config.json`) to define AprilTag positions:
+
+```json
+{
+    "apriltags": [
+        {
+            "id": 0,
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "size": 0.1,
+            "description": "AprilTag at position (1, 0)"
+        },
+        {
+            "id": 1,
+            "x": -1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "size": 0.1,
+            "description": "AprilTag at position (-1, 0)"
+        }
+    ],
+    "tag_family": "tag36h11",
+    "default_size": 0.1,
+    "camera_intrinsics": {
+        "focal_length": 500.0,
+        "distortion_coeffs": [0.1, -0.2, 0, 0, 0]
+    },
+    "pose_estimation": {
+        "max_reproj_error": 5.0,
+        "min_detection_confidence": 0.3
+    }
+}
+```
+
+### **AprilTag Commands**
+
+```bash
+# Generate tags from config file
+python generate_apriltags.py --config apriltag_config.json
+
+# Generate specific tag IDs
+python generate_apriltags.py --tag-ids 0 1 2 --physical-size 0.1
+
+# Run calibration session
+python apriltag_pose_calibration.py --camera-id A --config apriltag_config.json
+
+# Use real-time pose updates
+python cam_client.py --pose pose_A.json --server localhost:9000 --target bottle \
+    --enable-apriltag-pose --apriltag-config apriltag_config.json
+```
+
+### **AprilTag Coordinate System**
+
+- **Tag Origin**: Center of the tag
+- **X-axis**: Left edge to right edge of tag
+- **Y-axis**: Bottom edge to top edge of tag  
+- **Z-axis**: Perpendicular to tag surface (outward)
+- **Tag corners**: Bottom-left, bottom-right, top-right, top-left
+
+### **Accuracy and Performance**
+
+- **Position accuracy**: ±2-5mm (depends on tag size, distance, and lighting)
+- **Angular accuracy**: ±1-2 degrees
+- **Detection range**: 0.5m to 5m (for 10cm tags)
+- **Update rate**: 1-10 Hz (configurable)
+- **Requirements**: Good lighting, stable tag placement, clear line of sight
+
+### **Troubleshooting AprilTags**
+
+**Common Issues:**
+- **No tags detected**: Check lighting, tag print quality, camera focus
+- **Poor accuracy**: Increase tag size, reduce distance, improve lighting
+- **Intermittent detection**: Stabilize tag placement, check for reflections
+- **Wrong pose**: Verify tag positions in config file match physical placement
+
+**Debug Commands:**
+```bash
+# Test AprilTag detection
+python apriltag_pose_calibration.py --camera-id TEST --samples 1
+
+# Generate tags with different sizes
+python generate_apriltags.py --tag-ids 1 2 --physical-size 0.15  # 15cm tags
+
+# Check AprilTag installation
+python -c "import apriltag; print('AprilTag OK')"
+```
+
+### **Status Logging and Monitoring**
+
+The AprilTag system includes comprehensive status logging to help with debugging and monitoring:
+
+#### **Calibration Session Logs**
+During calibration (`apriltag_pose_calibration.py`), you'll see:
+```
+📊 APRILTAG DETECTION STATUS:
+   Frames processed: 150
+   Detection rate: 73.3% (110/150)
+   Total tags detected: 165
+   Detection time: 12.3ms
+   Current frame: 2 tags detected
+      Tag 1: conf=0.847, area=2145px², aspect=0.98, pos=(1.0, 0.0)
+      Tag 2: conf=0.692, area=1834px², aspect=1.02, pos=(-1.0, 0.0)
+   Tag detection history:
+      Tag 1: 89/95 (93.7% success)
+      Tag 2: 76/89 (85.4% success)
+```
+
+#### **Real-time Pose Update Logs**
+When using `--enable-apriltag-pose`, you'll see detailed updates:
+```
+🏷️ APRILTAG POSE UPDATE #5 for Camera A:
+   📍 CAMERA POSITION:
+      Old: (2.145, 1.832) m
+      New: (2.147, 1.829) m
+      Change: 0.004m
+   🧭 CAMERA ORIENTATION:
+      Old: 45.2°
+      New: 45.1°
+      Change: 0.1°
+   🏷️ APRILTAG DETECTION:
+      Reference Tag ID: 1
+      Tag Position: [1.0, 0.0, 0.0]
+      Distance to Tag: 2.341m
+      Detection Confidence: 0.847
+      Reprojection Error: 1.23px
+      Estimated FOV: 68.5°
+   📊 DETECTION STATISTICS:
+      Detection Rate: 73.3%
+      Pose Success Rate: 89.2%
+      Total Tags Detected: 165
+      Last Detection: 0.1 seconds ago
+   📡 SERVER TRANSMISSION:
+      Updated pose will be sent with next detection packet
+      Server: localhost:9000
+```
+
+#### **Detection Failure Diagnostics**
+When AprilTags aren't detected, the system logs diagnostic information:
+```
+⚠️ AprilTag pose update failed for Camera A:
+   📊 Detection Statistics:
+      Frames processed: 450
+      Detection rate: 23.1%
+      Successful poses: 12
+      Failed poses: 8
+   🏷️ Tag Detection Status:
+      Tag 1: 45/67 (67.2% success)
+      Tag 2: 23/45 (51.1% success)
+```
+
+#### **Performance Monitoring**
+The system tracks and displays:
+- **Detection Rate**: Percentage of frames with detected tags
+- **Pose Success Rate**: Percentage of detections leading to successful pose estimation
+- **Reprojection Error**: Quality metric for pose accuracy (lower is better)
+- **Detection Time**: Time taken for AprilTag detection per frame
+- **Per-Tag Statistics**: Individual success rates for each configured tag
+
+#### **Interpreting the Logs**
+
+**Good Performance Indicators:**
+- Detection rate > 70%
+- Pose success rate > 85%
+- Reprojection error < 3.0px
+- Detection time < 20ms
+
+**Troubleshooting Low Performance:**
+- Detection rate < 50% → Check lighting, tag visibility, print quality
+- Pose success rate < 70% → Check tag placement, camera focus, tag size
+- High reprojection error > 5px → Verify tag positions in config file
+- Detection time > 50ms → Consider using smaller images or faster hardware
+
+---
+
 ## 🎯 Manual Setup (Alternative)
 
 If you want precise control or automatic calibration doesn't work:

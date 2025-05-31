@@ -139,6 +139,12 @@ class AprilTagPoseEstimator:
             'detection_rate_history': []  # Add missing field from working calibration
         }
         
+        # Distance scaling for visualization (default 1.0, can be overridden)
+        self.distance_scale_factor = 1.0
+        
+        # Verbose debugging flag (can be enabled for troubleshooting)
+        self.verbose_debug = False
+        
         print(f"🔧 Detection confidence threshold: {self.min_detection_confidence}")
         print(f"🔧 Max reprojection error: {self.max_reproj_error}")
         print(f"🔧 AprilTag Pose Estimator initialized for camera {camera_id}")
@@ -208,82 +214,130 @@ class AprilTagPoseEstimator:
         self.detection_stats['total_frames'] += 1
         current_time = time.time()
         
+        if self.verbose_debug:
+            print(f"🔍 FRAME DEBUG: Processing frame #{self.detection_stats['total_frames']}")
+            print(f"   Frame shape: {frame.shape}")
+            print(f"   Frame dtype: {frame.dtype}")
+            print(f"   Frame min/max values: {frame.min()}/{frame.max()}")
+        
         # Convert to grayscale for AprilTag detection
         if len(frame.shape) == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if self.verbose_debug:
+                print(f"   Converted to grayscale: {gray.shape}")
         else:
             gray = frame
+            if self.verbose_debug:
+                print(f"   Already grayscale: {gray.shape}")
+        
+        if self.verbose_debug:
+            print(f"   Grayscale min/max: {gray.min()}/{gray.max()}")
         
         # Detect tags using robotpy_apriltag
         start_time = time.time()
-        detections = self.detector.detect(gray)
-        detection_time = time.time() - start_time
+        if self.verbose_debug:
+            print(f"   Calling detector.detect() with robotpy_apriltag...")
+        try:
+            detections = self.detector.detect(gray)
+            detection_time = time.time() - start_time
+            if self.verbose_debug:
+                print(f"   ✅ Detection completed in {detection_time*1000:.1f}ms")
+            print(f"   Raw detections found: {len(detections)}")
+        except Exception as e:
+            print(f"   ❌ Detection failed with error: {e}")
+            return []
         
         detected_tags = []
         rejected_tags = []
         
-        for detection in detections:
-            tag_id = detection.getId()
-            confidence = detection.getDecisionMargin()
-            
-            # Log detection attempt
-            if tag_id not in self.detection_stats['tag_detection_counts']:
-                self.detection_stats['tag_detection_counts'][tag_id] = {'seen': 0, 'accepted': 0, 'rejected': 0}
-            
-            self.detection_stats['tag_detection_counts'][tag_id]['seen'] += 1
-            
-            # Check confidence threshold
-            if confidence < self.min_detection_confidence:
-                rejected_tags.append({'id': tag_id, 'confidence': confidence, 'reason': 'low_confidence'})
-                self.detection_stats['tag_detection_counts'][tag_id]['rejected'] += 1
+        for i, detection in enumerate(detections):
+            try:
+                tag_id = detection.getId()
+                confidence = detection.getDecisionMargin()
+                
+                if self.verbose_debug:
+                    print(f"   Processing detection {i+1}: Tag ID {tag_id}, confidence {confidence:.3f}")
+                
+                # Log detection attempt
+                if tag_id not in self.detection_stats['tag_detection_counts']:
+                    self.detection_stats['tag_detection_counts'][tag_id] = {'seen': 0, 'accepted': 0, 'rejected': 0}
+                
+                self.detection_stats['tag_detection_counts'][tag_id]['seen'] += 1
+                
+                # Check confidence threshold
+                if confidence < self.min_detection_confidence:
+                    rejected_tags.append({'id': tag_id, 'confidence': confidence, 'reason': 'low_confidence'})
+                    self.detection_stats['tag_detection_counts'][tag_id]['rejected'] += 1
+                    if self.verbose_debug:
+                        print(f"      ❌ Rejected: confidence {confidence:.3f} < threshold {self.min_detection_confidence}")
+                    continue
+                
+                # Check if tag is in our configuration
+                if tag_id not in self.tag_positions:
+                    rejected_tags.append({'id': tag_id, 'confidence': confidence, 'reason': 'unknown_id'})
+                    if self.verbose_debug:
+                        print(f"      ❌ Rejected: unknown tag ID {tag_id} (not in config)")
+                    else:
+                        print(f"⚠️  Detected unknown tag ID {tag_id} (confidence: {confidence:.3f}) - not in config")
+                    continue
+                
+                # Extract corner coordinates from robotpy_apriltag detection
+                corners = np.array([
+                    [detection.getCorner(0).x, detection.getCorner(0).y],
+                    [detection.getCorner(1).x, detection.getCorner(1).y],
+                    [detection.getCorner(2).x, detection.getCorner(2).y],
+                    [detection.getCorner(3).x, detection.getCorner(3).y]
+                ], dtype=np.float32)
+                
+                # Calculate center point
+                center = detection.getCenter()
+                center_point = (center.x, center.y)
+                
+                # Calculate tag area and aspect ratio for quality assessment
+                tag_area = cv2.contourArea(corners)
+                x_min, x_max = np.min(corners[:, 0]), np.max(corners[:, 0])
+                y_min, y_max = np.min(corners[:, 1]), np.max(corners[:, 1])
+                width = x_max - x_min
+                height = y_max - y_min
+                aspect_ratio = width / height if height > 0 else 0
+                
+                if self.verbose_debug:
+                    print(f"      ✅ Accepted: center=({center_point[0]:.1f}, {center_point[1]:.1f}), area={tag_area:.0f}px², aspect={aspect_ratio:.2f}")
+                
+                detected_tags.append({
+                    'id': tag_id,
+                    'corners': corners,
+                    'center': center_point,
+                    'confidence': confidence,
+                    'tag_info': self.tag_positions[tag_id],
+                    'area': tag_area,
+                    'width': width,
+                    'height': height,
+                    'aspect_ratio': aspect_ratio,
+                    'detection_time': detection_time
+                })
+                
+                self.detection_stats['tag_detection_counts'][tag_id]['accepted'] += 1
+                
+            except Exception as e:
+                print(f"      ❌ Error processing detection {i+1}: {e}")
                 continue
-            
-            # Check if tag is in our configuration
-            if tag_id not in self.tag_positions:
-                rejected_tags.append({'id': tag_id, 'confidence': confidence, 'reason': 'unknown_id'})
-                print(f"⚠️  Detected unknown tag ID {tag_id} (confidence: {confidence:.3f}) - skipping")
-                continue
-            
-            # Extract corner coordinates from robotpy_apriltag detection
-            corners = np.array([
-                [detection.getCorner(0).x, detection.getCorner(0).y],
-                [detection.getCorner(1).x, detection.getCorner(1).y],
-                [detection.getCorner(2).x, detection.getCorner(2).y],
-                [detection.getCorner(3).x, detection.getCorner(3).y]
-            ], dtype=np.float32)
-            
-            # Calculate center point
-            center = detection.getCenter()
-            center_point = (center.x, center.y)
-            
-            # Calculate tag area and aspect ratio for quality assessment
-            tag_area = cv2.contourArea(corners)
-            x_min, x_max = np.min(corners[:, 0]), np.max(corners[:, 0])
-            y_min, y_max = np.min(corners[:, 1]), np.max(corners[:, 1])
-            width = x_max - x_min
-            height = y_max - y_min
-            aspect_ratio = width / height if height > 0 else 0
-            
-            detected_tags.append({
-                'id': tag_id,
-                'corners': corners,
-                'center': center_point,
-                'confidence': confidence,
-                'tag_info': self.tag_positions[tag_id],
-                'area': tag_area,
-                'width': width,
-                'height': height,
-                'aspect_ratio': aspect_ratio,
-                'detection_time': detection_time
-            })
-            
-            self.detection_stats['tag_detection_counts'][tag_id]['accepted'] += 1
         
         # Update statistics
         if detected_tags:
             self.detection_stats['frames_with_tags'] += 1
             self.detection_stats['total_tags_detected'] += len(detected_tags)
             self.detection_stats['last_detection_time'] = current_time
+        
+        # Always show detection result summary (not just in verbose mode)
+        if detected_tags or rejected_tags:
+            print(f"   📊 FRAME #{self.detection_stats['total_frames']}: {len(detected_tags)} accepted, {len(rejected_tags)} rejected")
+            if detected_tags:
+                for tag in detected_tags:
+                    print(f"      ✅ Tag {tag['id']}: confidence={tag['confidence']:.3f}, area={tag['area']:.0f}px²")
+            if rejected_tags:
+                for tag in rejected_tags:
+                    print(f"      ❌ Tag {tag['id']}: confidence={tag['confidence']:.3f}, reason={tag['reason']}")
         
         # Log detection summary periodically (every 30 frames to match working calibration)
         if self.detection_stats['total_frames'] % 30 == 0:  # Every 30 frames like working calibration
@@ -462,10 +516,10 @@ class AprilTagPoseEstimator:
                 
                 # Camera offset from tag in tag coordinates
                 camera_offset_x = cam_pos_in_tag[0]  # Horizontal offset along wall
-                camera_distance_from_wall = cam_pos_in_tag[1]  # Distance from wall (depth)
+                camera_distance_from_wall = cam_pos_in_tag[1] * self.distance_scale_factor  # Apply distance scaling
                 camera_height = cam_pos_in_tag[2]  # Height relative to tag center
                 
-                print(f"🔍 DEBUG: Camera relative to vertical tag: X={camera_offset_x:.3f}m, Distance={camera_distance_from_wall:.3f}m, Height={camera_height:.3f}m")
+                print(f"🔍 DEBUG: Camera relative to vertical tag: X={camera_offset_x:.3f}m, Distance={camera_distance_from_wall:.3f}m (scaled by {self.distance_scale_factor}x), Height={camera_height:.3f}m")
                 
                 # Apply horizontal flip correction
                 if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
@@ -527,11 +581,11 @@ class AprilTagPoseEstimator:
                 
             else:
                 # HORIZONTAL TAG (on floor) - fix coordinate transformation
-                camera_height_above_tag = cam_pos_in_tag[2]
+                camera_height_above_tag = cam_pos_in_tag[2] * self.distance_scale_factor  # Apply distance scaling to height
                 camera_offset_x = cam_pos_in_tag[0]
                 camera_offset_y = cam_pos_in_tag[1]
                 
-                print(f"🔍 DEBUG: Camera relative to horizontal tag: X={camera_offset_x:.3f}m, Y={camera_offset_y:.3f}m, Height={camera_height_above_tag:.3f}m")
+                print(f"🔍 DEBUG: Camera relative to horizontal tag: X={camera_offset_x:.3f}m, Y={camera_offset_y:.3f}m, Height={camera_height_above_tag:.3f}m (scaled by {self.distance_scale_factor}x)")
                 
                 # Apply horizontal flip correction
                 if hasattr(self, '_is_horizontally_flipped') and self._is_horizontally_flipped:
@@ -665,8 +719,9 @@ class AprilTagPoseEstimator:
             # Assuming focal length from config
             focal_length = self.focal_length
             estimated_distance = (tag_size * focal_length) / tag_width_pixels
+            estimated_distance *= self.distance_scale_factor  # Apply distance scaling for better visualization
             
-            print(f"🔍 2D DEBUG: Estimated distance to tag: {estimated_distance:.3f}m")
+            print(f"🔍 2D DEBUG: Estimated distance to tag: {estimated_distance:.3f}m (scaled by {self.distance_scale_factor}x)")
             
             # Calculate horizontal offset from tag center
             frame_center_x = frame_shape[1] / 2
@@ -763,17 +818,21 @@ class CameraClient:
         self.flip_horizontal = flip_horizontal
         self.enable_apriltag_pose = enable_apriltag_pose
         
-        # AprilTag pose estimation
+        # Distance scaling for visualization (makes camera appear further from tags)
+        self.distance_scale_factor = 1.5  # Multiply calculated distance by this factor
+        print(f"📏 Distance scale factor: {self.distance_scale_factor}x (for better visualization)")
+        
+        # AprilTag pose estimation (initialize after distance_scale_factor is defined)
         self.apriltag_estimator = None
         if enable_apriltag_pose:
             try:
                 self.apriltag_estimator = AprilTagPoseEstimator(self.pose['cam_id'], apriltag_config)
+                # Set distance scaling factor for better visualization
+                self.apriltag_estimator.distance_scale_factor = self.distance_scale_factor
                 print(f"🏷️  AprilTag pose estimation enabled (config: {apriltag_config}, update interval: {apriltag_update_interval}s)")
             except Exception as e:
                 print(f"❌ Failed to initialize AprilTag estimator: {e}")
                 self.enable_apriltag_pose = False
-        
-        print(f"🔄 Horizontal flip: {'Enabled' if flip_horizontal else 'Disabled'}")
         
         # Initialize YOLOv8-nano model
         print("📦 Loading YOLOv8-nano model...")
@@ -812,6 +871,18 @@ class CameraClient:
         self.last_pose_broadcast = 0
         self.pose_broadcast_interval = 0.5  # Send pose every 0.5 seconds even without detections
         self.pose_broadcast_count = 0
+        
+        # Pose smoothing parameters
+        self.pose_smoothing_enabled = True
+        self.pose_smoothing_alpha = 0.3  # Exponential smoothing factor (0.1 = very smooth, 0.9 = very reactive)
+        self.smoothed_pose = self.pose.copy()  # Current smoothed pose
+        self.raw_pose_history = []  # Keep history of raw poses for debugging
+        self.max_position_change = 0.5  # Maximum position change per update (meters)
+        self.max_yaw_change = 30.0  # Maximum yaw change per update (degrees)
+        
+        print(f"🎛️  Pose smoothing enabled with alpha={self.pose_smoothing_alpha} (lower = smoother)")
+        print(f"   Max position change: {self.max_position_change}m per update")
+        print(f"   Max yaw change: {self.max_yaw_change}° per update")
     
     def test_connection(self):
         """Test UDP connection to the server."""
@@ -829,6 +900,139 @@ class CameraClient:
         else:
             print("❌ UDP connection test failed - check server address and network")
     
+    def smooth_pose_update(self, new_pose: dict) -> dict:
+        """
+        Apply smoothing to pose updates to reduce jitter and abrupt movements.
+        
+        Args:
+            new_pose: Raw pose estimate from AprilTag detection
+            
+        Returns:
+            Smoothed pose dictionary
+        """
+        if not self.pose_smoothing_enabled:
+            return new_pose
+        
+        # Store raw pose for debugging
+        raw_pose_entry = {
+            'timestamp': time.time(),
+            'x': new_pose['x'],
+            'y': new_pose['y'],
+            'yaw_deg': new_pose['yaw_deg'],
+            'reference_tag_id': new_pose.get('reference_tag_id', 'unknown')
+        }
+        self.raw_pose_history.append(raw_pose_entry)
+        
+        # Keep only last 10 raw poses for debugging
+        if len(self.raw_pose_history) > 10:
+            self.raw_pose_history.pop(0)
+        
+        # Get current smoothed position
+        current_x = self.smoothed_pose['x']
+        current_y = self.smoothed_pose['y'] 
+        current_yaw = self.smoothed_pose['yaw_deg']
+        
+        # New raw position
+        new_x = new_pose['x']
+        new_y = new_pose['y']
+        new_yaw = new_pose['yaw_deg']
+        
+        # Calculate position change
+        position_change = math.sqrt((new_x - current_x)**2 + (new_y - current_y)**2)
+        
+        # Calculate yaw change (handle wraparound)
+        yaw_diff = new_yaw - current_yaw
+        if yaw_diff > 180:
+            yaw_diff -= 360
+        elif yaw_diff < -180:
+            yaw_diff += 360
+        yaw_change = abs(yaw_diff)
+        
+        # Apply maximum change limits to prevent sudden jumps
+        if position_change > self.max_position_change:
+            # Limit the position change
+            scale_factor = self.max_position_change / position_change
+            new_x = current_x + (new_x - current_x) * scale_factor
+            new_y = current_y + (new_y - current_y) * scale_factor
+            print(f"🚧 Position change limited: {position_change:.3f}m -> {self.max_position_change:.3f}m")
+        
+        if yaw_change > self.max_yaw_change:
+            # Limit the yaw change
+            scale_factor = self.max_yaw_change / yaw_change
+            yaw_diff_limited = yaw_diff * scale_factor
+            new_yaw = current_yaw + yaw_diff_limited
+            print(f"🚧 Yaw change limited: {yaw_change:.1f}° -> {self.max_yaw_change:.1f}°")
+        
+        # Apply exponential smoothing
+        alpha = self.pose_smoothing_alpha
+        smoothed_x = alpha * new_x + (1 - alpha) * current_x
+        smoothed_y = alpha * new_y + (1 - alpha) * current_y
+        smoothed_yaw = alpha * new_yaw + (1 - alpha) * current_yaw
+        
+        # Normalize yaw to 0-360 range
+        smoothed_yaw = smoothed_yaw % 360
+        
+        # Create smoothed pose
+        smoothed_pose = new_pose.copy()
+        smoothed_pose.update({
+            'x': smoothed_x,
+            'y': smoothed_y,
+            'yaw_deg': smoothed_yaw,
+            'smoothing_applied': True,
+            'raw_x': new_pose['x'],
+            'raw_y': new_pose['y'],
+            'raw_yaw_deg': new_pose['yaw_deg'],
+            'position_change': position_change,
+            'yaw_change': yaw_change,
+            'smoothing_alpha': alpha
+        })
+        
+        # Update internal smoothed pose
+        self.smoothed_pose.update({
+            'x': smoothed_x,
+            'y': smoothed_y,
+            'yaw_deg': smoothed_yaw,
+            'fov_deg': new_pose.get('fov_deg', self.smoothed_pose['fov_deg'])
+        })
+        
+        # Debug logging for smoothing
+        print(f"🎛️  POSE SMOOTHING for Camera {self.pose['cam_id']}:")
+        print(f"   Raw pose: ({new_pose['x']:.3f}, {new_pose['y']:.3f}) @ {new_pose['yaw_deg']:.1f}°")
+        print(f"   Smoothed: ({smoothed_x:.3f}, {smoothed_y:.3f}) @ {smoothed_yaw:.1f}°")
+        print(f"   Changes: pos={position_change:.3f}m, yaw={yaw_change:.1f}°")
+        print(f"   Alpha: {alpha}, Limits: pos={self.max_position_change}m, yaw={self.max_yaw_change}°")
+        
+        return smoothed_pose
+    
+    def get_pose_smoothing_stats(self) -> dict:
+        """Get statistics about pose smoothing."""
+        if not self.raw_pose_history:
+            return {'message': 'No pose history available'}
+        
+        # Calculate position variance from recent poses
+        if len(self.raw_pose_history) >= 2:
+            positions = [(p['x'], p['y']) for p in self.raw_pose_history]
+            x_coords = [p[0] for p in positions]
+            y_coords = [p[1] for p in positions]
+            
+            x_variance = np.var(x_coords) if len(x_coords) > 1 else 0
+            y_variance = np.var(y_coords) if len(y_coords) > 1 else 0
+            position_variance = x_variance + y_variance
+            
+            yaws = [p['yaw_deg'] for p in self.raw_pose_history]
+            yaw_variance = np.var(yaws) if len(yaws) > 1 else 0
+            
+            return {
+                'raw_poses_count': len(self.raw_pose_history),
+                'position_variance': position_variance,
+                'yaw_variance': yaw_variance,
+                'smoothing_alpha': self.pose_smoothing_alpha,
+                'current_smoothed_pose': (self.smoothed_pose['x'], self.smoothed_pose['y'], self.smoothed_pose['yaw_deg']),
+                'latest_raw_pose': (self.raw_pose_history[-1]['x'], self.raw_pose_history[-1]['y'], self.raw_pose_history[-1]['yaw_deg'])
+            }
+        
+        return {'message': 'Insufficient pose history for statistics'}
+
     def update_pose_from_apriltags(self, frame: np.ndarray) -> bool:
         """
         Update camera pose using AprilTag detection.
@@ -855,22 +1059,25 @@ class CameraClient:
         if apriltag_pose is not None:
             print(f"✅ DEBUG: Got AprilTag pose: {apriltag_pose}")
             
-            # Update current pose with AprilTag-based pose
+            # Apply pose smoothing before updating current pose
+            smoothed_apriltag_pose = self.smooth_pose_update(apriltag_pose)
+            
+            # Update current pose with smoothed AprilTag-based pose
             old_pose = self.pose.copy()
             
             self.pose.update({
-                'x': apriltag_pose['x'],
-                'y': apriltag_pose['y'], 
-                'yaw_deg': apriltag_pose['yaw_deg'],
-                'fov_deg': apriltag_pose['fov_deg']
+                'x': smoothed_apriltag_pose['x'],
+                'y': smoothed_apriltag_pose['y'], 
+                'yaw_deg': smoothed_apriltag_pose['yaw_deg'],
+                'fov_deg': smoothed_apriltag_pose['fov_deg']
             })
             
             self.last_apriltag_update = current_time
             self.apriltag_update_count += 1
             
-            # Calculate position change
-            position_change = math.sqrt((apriltag_pose['x'] - old_pose['x'])**2 + (apriltag_pose['y'] - old_pose['y'])**2)
-            yaw_change = abs(apriltag_pose['yaw_deg'] - old_pose['yaw_deg'])
+            # Calculate position change (using smoothed values)
+            position_change = math.sqrt((smoothed_apriltag_pose['x'] - old_pose['x'])**2 + (smoothed_apriltag_pose['y'] - old_pose['y'])**2)
+            yaw_change = abs(smoothed_apriltag_pose['yaw_deg'] - old_pose['yaw_deg'])
             if yaw_change > 180:
                 yaw_change = 360 - yaw_change  # Handle wraparound
             
@@ -880,12 +1087,19 @@ class CameraClient:
             print(f"\n🏷️  APRILTAG POSE UPDATE #{self.apriltag_update_count} for Camera {self.pose['cam_id']}:")
             print(f"   📍 CAMERA POSITION:")
             print(f"      Old: ({old_pose['x']:.3f}, {old_pose['y']:.3f}) m")
-            print(f"      New: ({self.pose['x']:.3f}, {self.pose['y']:.3f}) m")
+            print(f"      Raw: ({apriltag_pose['x']:.3f}, {apriltag_pose['y']:.3f}) m")
+            print(f"      Smoothed: ({self.pose['x']:.3f}, {self.pose['y']:.3f}) m")
             print(f"      Change: {position_change:.3f}m")
             print(f"   🧭 CAMERA ORIENTATION:")
             print(f"      Old: {old_pose['yaw_deg']:.1f}°")
-            print(f"      New: {self.pose['yaw_deg']:.1f}°")
+            print(f"      Raw: {apriltag_pose['yaw_deg']:.1f}°")
+            print(f"      Smoothed: {self.pose['yaw_deg']:.1f}°")
             print(f"      Change: {yaw_change:.1f}°")
+            print(f"   🎛️  SMOOTHING STATUS:")
+            print(f"      Enabled: {'YES' if self.pose_smoothing_enabled else 'NO'}")
+            print(f"      Alpha: {self.pose_smoothing_alpha} (lower = smoother)")
+            print(f"      Raw position change: {smoothed_apriltag_pose.get('position_change', 'N/A'):.3f}m")
+            print(f"      Raw yaw change: {smoothed_apriltag_pose.get('yaw_change', 'N/A'):.1f}°")
             print(f"   🔄 COORDINATE SYSTEM:")
             print(f"      Horizontal flip: {'ENABLED' if self.flip_horizontal else 'DISABLED'}")
             print(f"      Flip correction applied: {'YES' if hasattr(self.apriltag_estimator, '_is_horizontally_flipped') and self.apriltag_estimator._is_horizontally_flipped else 'NO'}")
@@ -1094,7 +1308,7 @@ class CameraClient:
         
         packet = {
             "cam_id": self.pose['cam_id'],
-            "pose_broadcast": True,
+            "pose_broadcast": True,  # Flag to indicate this is an immediate pose update
             "immediate_update": True,  # Flag to indicate this is an immediate pose update
             "timestamp": current_time,
             "pose": {
@@ -1265,6 +1479,20 @@ class CameraClient:
                     cv2.putText(display_frame, pose_success_text,
                                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     y_offset += 25
+                    
+                    # Show pose smoothing status
+                    if self.pose_smoothing_enabled:
+                        smoothing_stats = self.get_pose_smoothing_stats()
+                        if 'position_variance' in smoothing_stats:
+                            smoothing_text = f"Smoothing: α={self.pose_smoothing_alpha} | Pos Var: {smoothing_stats['position_variance']:.4f} | Yaw Var: {smoothing_stats['yaw_variance']:.2f}"
+                            cv2.putText(display_frame, smoothing_text,
+                                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                            y_offset += 20
+                    else:
+                        smoothing_text = "Smoothing: DISABLED (immediate updates)"
+                        cv2.putText(display_frame, smoothing_text,
+                                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+                        y_offset += 20
                     
                     # Show current pose
                     pose_text = f"Pose: ({self.pose['x']:.2f}, {self.pose['y']:.2f}) | Yaw: {self.pose['yaw_deg']:.1f}° | FOV: {self.pose['fov_deg']:.1f}°"
@@ -1438,6 +1666,26 @@ async def main():
     parser.add_argument('--apriltag-update-interval', type=float, default=1.0,
                        help='AprilTag pose update interval in seconds (default: 1.0s)')
     
+    # Pose smoothing arguments
+    parser.add_argument('--disable-pose-smoothing', action='store_true',
+                       help='Disable pose smoothing (poses will update immediately)')
+    parser.add_argument('--smoothing-alpha', type=float, default=0.3,
+                       help='Pose smoothing factor (0.1=very smooth, 0.9=very reactive, default: 0.3)')
+    parser.add_argument('--max-position-change', type=float, default=0.5,
+                       help='Maximum position change per update in meters (default: 0.5m)')
+    parser.add_argument('--max-yaw-change', type=float, default=30.0,
+                       help='Maximum yaw change per update in degrees (default: 30°)')
+    
+    # Distance scaling for visualization
+    parser.add_argument('--distance-scale', type=float, default=1.5,
+                       help='Distance scaling factor for visualization (default: 1.5x, makes camera appear further from tags)')
+    
+    # AprilTag detection tuning
+    parser.add_argument('--apriltag-confidence', type=float, default=None,
+                       help='Override AprilTag detection confidence threshold (default: use config file value)')
+    parser.add_argument('--apriltag-debug', action='store_true',
+                       help='Enable extra verbose AprilTag debugging output')
+    
     args = parser.parse_args()
     
     # Flip is enabled by default, disabled only if --no-flip is specified
@@ -1449,6 +1697,16 @@ async def main():
         print(f"   Update interval: {args.apriltag_update_interval}s")
         print(f"   💡 Place AprilTags at the positions specified in {args.apriltag_config}")
         print(f"   💡 Camera pose will automatically update every {args.apriltag_update_interval}s when tags are detected")
+        
+        # Show smoothing configuration
+        if not args.disable_pose_smoothing:
+            print(f"🎛️  Pose smoothing enabled:")
+            print(f"   Smoothing alpha: {args.smoothing_alpha} (lower = smoother)")
+            print(f"   Max position change: {args.max_position_change}m per update")
+            print(f"   Max yaw change: {args.max_yaw_change}° per update")
+            print(f"   💡 Adjust --smoothing-alpha for more/less responsiveness")
+        else:
+            print(f"🎛️  Pose smoothing disabled - poses will update immediately")
     
     # Create and run client
     try:
@@ -1462,6 +1720,38 @@ async def main():
             args.apriltag_config,
             args.apriltag_update_interval
         )
+        
+        # Configure pose smoothing if AprilTag pose estimation is enabled
+        if args.enable_apriltag_pose:
+            client.pose_smoothing_enabled = not args.disable_pose_smoothing
+            client.pose_smoothing_alpha = args.smoothing_alpha
+            client.max_position_change = args.max_position_change
+            client.max_yaw_change = args.max_yaw_change
+            
+            # Configure distance scaling
+            client.distance_scale_factor = args.distance_scale
+            if client.apriltag_estimator:
+                client.apriltag_estimator.distance_scale_factor = args.distance_scale
+                
+                # Configure AprilTag detection parameters
+                if args.apriltag_confidence is not None:
+                    old_confidence = client.apriltag_estimator.min_detection_confidence
+                    client.apriltag_estimator.min_detection_confidence = args.apriltag_confidence
+                    print(f"🔧 AprilTag confidence threshold overridden: {old_confidence} -> {args.apriltag_confidence}")
+                
+                # Enable verbose debugging if requested
+                client.apriltag_estimator.verbose_debug = args.apriltag_debug
+                if args.apriltag_debug:
+                    print(f"🔧 Extra verbose AprilTag debugging enabled")
+            
+            print(f"🔧 Pose smoothing configured:")
+            print(f"   Enabled: {client.pose_smoothing_enabled}")
+            if client.pose_smoothing_enabled:
+                print(f"   Alpha: {client.pose_smoothing_alpha}")
+                print(f"   Max position change: {client.max_position_change}m")
+                print(f"   Max yaw change: {client.max_yaw_change}°")
+            print(f"📏 Distance scaling: {client.distance_scale_factor}x (camera will appear further from tags)")
+        
         await client.run_detection_loop()
     except KeyboardInterrupt:
         print("\n🛑 Stopped by user")

@@ -54,7 +54,7 @@ class FusionServer:
         
         # Storage for detection rays (for visualization)
         self.detection_rays = {}  # cam_id -> (ray_start, ray_end, timestamp)
-        self.ray_timeout = 2.0  # Show rays for 2 seconds
+        self.ray_timeout = 0.5  # Show rays for 2 seconds
         
         # Triangulated positions for plotting (thread-safe)
         self.positions = []

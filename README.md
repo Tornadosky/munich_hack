@@ -8,6 +8,18 @@ A minimal-friction prototype for real-time object localization using two laptops
 pip install -r requirements.txt
 ```
 
+## YOLO Detection Testing
+
+Test high-performance 60 FPS YOLO detection:
+
+```bash
+# Smooth 60 FPS detection (recommended)
+python smooth_yolo_test.py --target bottle --confidence 0.3
+
+# Camera diagnostics (if having camera issues)
+python camera_test.py
+```
+
 ## Quick Demo (No Webcams Required)
 
 ```bash
@@ -61,6 +73,13 @@ python cam_client.py --pose pose_A.json --server 192.168.1.90:9000 --target bott
 # Laptop B  
 python cam_client.py --pose pose_B.json --server 192.168.1.90:9000 --target bottle
 ```
+
+## Performance Features
+
+- **Smooth 60 FPS display**: Threaded architecture separates camera capture from detection
+- **Real-time object detection**: YOLOv8-nano optimized for performance
+- **Lag-free experience**: Non-blocking frame processing with smart queue management
+- **Live triangulation**: Real-time position plotting with matplotlib
 
 ## Testing
 

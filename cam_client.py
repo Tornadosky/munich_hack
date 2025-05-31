@@ -8,8 +8,45 @@ import json
 import time
 import argparse
 import asyncio
+import socket
 from ultralytics import YOLO
-from utils import udp_send
+
+
+def udp_send_with_retry(payload: dict, addr: tuple, max_retries: int = 3) -> bool:
+    """
+    Send JSON payload via UDP with retry logic and better error handling.
+    
+    Args:
+        payload: Dictionary to send as JSON
+        addr: (host, port) tuple for destination
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    for attempt in range(max_retries):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(1.0)  # 1 second timeout
+            message = json.dumps(payload).encode('utf-8')
+            sock.sendto(message, addr)
+            sock.close()
+            return True
+        except socket.timeout:
+            print(f"UDP send timeout (attempt {attempt + 1}/{max_retries})")
+        except socket.gaierror as e:
+            print(f"UDP send DNS error: {e}")
+            return False  # Don't retry DNS errors
+        except Exception as e:
+            print(f"UDP send error (attempt {attempt + 1}/{max_retries}): {e}")
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+    
+    print(f"Failed to send UDP packet after {max_retries} attempts")
+    return False
 
 
 class CameraClient:
@@ -52,6 +89,25 @@ class CameraClient:
             raise ValueError(f"Target class '{target_class}' not found in YOLO classes")
         
         print(f"Camera {self.pose['cam_id']} ready, detecting '{target_class}'")
+        print(f"Will send detections to {self.server_addr}")
+        
+        # Test UDP connection
+        self.test_connection()
+    
+    def test_connection(self):
+        """Test UDP connection to the server."""
+        test_packet = {
+            "cam_id": self.pose['cam_id'],
+            "test": True,
+            "timestamp": time.time()
+        }
+        
+        print(f"Testing UDP connection to {self.server_addr}...")
+        success = udp_send_with_retry(test_packet, self.server_addr, max_retries=1)
+        if success:
+            print("✓ UDP connection test successful")
+        else:
+            print("✗ UDP connection test failed - check server address and network")
     
     def start_capture(self):
         """Initialize webcam capture."""
@@ -62,6 +118,11 @@ class CameraClient:
         # Set capture resolution to match pose config
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.pose['img_w'])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.pose['img_h'])
+        
+        # Verify actual resolution
+        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Camera resolution: {actual_w}x{actual_h} (requested: {self.pose['img_w']}x{self.pose['img_h']})")
     
     def detect_objects(self, frame):
         """
@@ -93,12 +154,15 @@ class CameraClient:
         
         return detections
     
-    def send_detection(self, cx: float, cy: float):
+    def send_detection(self, cx: float, cy: float) -> bool:
         """
         Send detection packet to fusion server via UDP.
         
         Args:
             cx, cy: Center coordinates of detected object
+            
+        Returns:
+            True if packet was sent successfully
         """
         packet = {
             "cam_id": self.pose['cam_id'],
@@ -115,14 +179,26 @@ class CameraClient:
             }
         }
         
-        udp_send(packet, self.server_addr)
-        print(f"Sent detection: cam={self.pose['cam_id']}, cx={cx:.1f}, cy={cy:.1f}")
+        success = udp_send_with_retry(packet, self.server_addr)
+        if success:
+            print(f"✓ Sent detection: cam={self.pose['cam_id']}, cx={cx:.1f}, cy={cy:.1f}")
+        else:
+            print(f"✗ Failed to send detection: cam={self.pose['cam_id']}, cx={cx:.1f}, cy={cy:.1f}")
+        
+        return success
     
     async def run_detection_loop(self):
         """Main detection loop running at specified FPS."""
         self.start_capture()
         
+        frame_count = 0
+        successful_sends = 0
+        failed_sends = 0
+        
         try:
+            print(f"Starting detection loop at {1/self.detection_interval:.1f} FPS")
+            print("Press 'q' to quit")
+            
             while True:
                 start_time = time.time()
                 
@@ -132,16 +208,29 @@ class CameraClient:
                     print("Failed to read frame")
                     break
                 
+                frame_count += 1
+                
                 # Run object detection
                 detections = self.detect_objects(frame)
                 
                 # Send each detection via UDP
                 for cx, cy in detections:
-                    self.send_detection(cx, cy)
+                    success = self.send_detection(cx, cy)
+                    if success:
+                        successful_sends += 1
+                    else:
+                        failed_sends += 1
                 
-                # Display frame with detection count
-                cv2.putText(frame, f"Detections: {len(detections)}", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                # Display frame with detection count and stats
+                status_text = f"Detections: {len(detections)} | Sent: {successful_sends} | Failed: {failed_sends}"
+                cv2.putText(frame, status_text, 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Show frame rate
+                fps_text = f"Frame: {frame_count}"
+                cv2.putText(frame, fps_text,
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
                 cv2.imshow(f"Camera {self.pose['cam_id']}", frame)
                 
                 # Break on 'q' key
@@ -154,6 +243,11 @@ class CameraClient:
                     await asyncio.sleep(self.detection_interval - elapsed)
                     
         finally:
+            print(f"\nSession stats:")
+            print(f"Frames processed: {frame_count}")
+            print(f"Successful sends: {successful_sends}")
+            print(f"Failed sends: {failed_sends}")
+            
             self.cap.release()
             cv2.destroyAllWindows()
 
@@ -169,8 +263,13 @@ async def main():
     args = parser.parse_args()
     
     # Create and run client
-    client = CameraClient(args.pose, args.server, args.target, args.fps)
-    await client.run_detection_loop()
+    try:
+        client = CameraClient(args.pose, args.server, args.target, args.fps)
+        await client.run_detection_loop()
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
 
 
 if __name__ == "__main__":

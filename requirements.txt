@@ -2,5 +2,5 @@ opencv-python>=4.8.0
 ultralytics>=8.0.0
 numpy>=1.21.0
 matplotlib>=3.5.0
-apriltag>=0.5.0
+robotpy-apriltag
 pillow>=10.0.0 

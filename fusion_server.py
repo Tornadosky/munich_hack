@@ -34,8 +34,8 @@ class FusionServer:
         self.poses = {}
         
         # Load AprilTag positions from config
-        self.apriltags = {}
-        self.load_apriltag_config()
+        self.apriltags = None
+        # self.load_apriltag_config()
         
         # Track when each camera was last seen
         self.camera_last_seen = {}
@@ -58,7 +58,10 @@ class FusionServer:
         
         # Storage for detection rays (for visualization)
         self.detection_rays = {}  # cam_id -> (ray_start, ray_end, timestamp)
-        self.ray_timeout = 0.5  # Show rays for 2 seconds
+        self.ray_timeout = 1  # Show rays for 2 seconds
+        
+        # Store references to ray artists for proper cleanup
+        self.ray_artists = []
         
         # Triangulated positions for plotting (thread-safe)
         self.positions = []
@@ -105,14 +108,15 @@ class FusionServer:
     def setup_plot(self):
         """Initialize matplotlib figure for real-time position plotting."""
         plt.ion()  # Enable interactive mode
-        self.fig, self.ax = plt.subplots(figsize=(10, 8))
+        self.fig, self.ax = plt.subplots(figsize=(8, 8))
         self.ax.set_xlabel('X (meters)')
         self.ax.set_ylabel('Y (meters)')
-        self.ax.set_title('Multi-Camera Object Triangulation with AprilTags')
+        self.ax.set_title('Multi-Camera Object Triangulation')
         self.ax.grid(True)
         
-        # Draw AprilTags on the plot
-        self.draw_apriltags()
+        # Draw AprilTags on the plot (only if they exist)
+        if self.apriltags:
+            self.draw_apriltags()
         
         # Don't plot any cameras initially - they will appear when clients connect
         # and start sending data
@@ -127,17 +131,17 @@ class FusionServer:
             tag_y_coords = [tag['y'] for tag in self.apriltags.values()]
             
             # Expand bounds to include expected camera positions
-            x_min = min(tag_x_coords) - 3.0  # 3m margin for cameras
-            x_max = max(tag_x_coords) + 3.0
-            y_min = min(tag_y_coords) - 1.0  # 1m behind wall
-            y_max = max(tag_y_coords) + 5.0  # 5m in front of wall for cameras
+            x_min = -0.5  # 3m margin for cameras
+            x_max = 2.5
+            y_min = -0.5  # 1m behind wall
+            y_max = 2.5  # 5m in front of wall for cameras
             
             self.ax.set_xlim(x_min, x_max)
             self.ax.set_ylim(y_min, y_max)
         else:
             # Default expanded view if no AprilTags
-            self.ax.set_xlim(-5, 5)
-            self.ax.set_ylim(-2, 8)
+            self.ax.set_xlim(-0.5, 2.5)
+            self.ax.set_ylim(-0.5, 2.5)
         
         self.ax.legend()
         
@@ -624,9 +628,9 @@ class FusionServer:
         if self.plot_needs_update:
             self.redraw_cameras()
             self.plot_needs_update = False
-        else:
-            # Only update detection rays if we're not doing a full redraw
-            self.update_detection_rays()
+        
+        # Always update detection rays (clear old ones and draw current ones)
+        self.update_detection_rays()
             
         with self._positions_lock:
             # Clean up old positions regularly (every frame)
@@ -646,9 +650,12 @@ class FusionServer:
                     cam_x_coords = [pose['x'] for pose in self.poses.values()]
                     cam_y_coords = [pose['y'] for pose in self.poses.values()]
                     
-                    # Get AprilTag positions
-                    tag_x_coords = [tag['x'] for tag in self.apriltags.values()]
-                    tag_y_coords = [tag['y'] for tag in self.apriltags.values()]
+                    # Get AprilTag positions (only if apriltags exist)
+                    tag_x_coords = []
+                    tag_y_coords = []
+                    if self.apriltags:
+                        tag_x_coords = [tag['x'] for tag in self.apriltags.values()]
+                        tag_y_coords = [tag['y'] for tag in self.apriltags.values()]
                     
                     # Combine object, camera, and AprilTag coordinates for axis limits
                     all_x = x_coords + cam_x_coords + tag_x_coords
@@ -678,8 +685,13 @@ class FusionServer:
     
     def update_detection_rays(self):
         """Update detection ray visualization on the plot."""
-        # Since we're using a clear-and-redraw approach in redraw_cameras(),
-        # we only need to draw current detection rays without removing old ones
+        # Clear all existing ray artists
+        for artist in self.ray_artists:
+            try:
+                artist.remove()
+            except ValueError:
+                pass  # Artist may have already been removed
+        self.ray_artists.clear()
         
         # Draw current detection rays
         current_time = time.time()
@@ -690,7 +702,11 @@ class FusionServer:
                 continue
             
             # Calculate alpha based on age (fade out over time)
-            alpha = max(0.1, min(1.0, 1.0 - (ray_age / self.ray_timeout)))
+            alpha = max(0.0, min(1.0, 1.0 - (ray_age / self.ray_timeout)))
+            
+            # Skip if alpha is too low to be visible
+            if alpha < 0.05:
+                continue
             
             # Choose color based on camera ID
             colors = {'A': 'red', 'B': 'blue', 'C': 'green', 'D': 'orange'}
@@ -700,10 +716,10 @@ class FusionServer:
             start = ray_data['start']
             end = ray_data['end']
             
-            self.ax.plot([start[0], end[0]], [start[1], end[1]], 
+            line_artist = self.ax.plot([start[0], end[0]], [start[1], end[1]], 
                         color=color, linewidth=3, alpha=alpha, 
-                        linestyle='--', zorder=4,
-                        label=f'Detection Ray {cam_id}')
+                        linestyle='--', zorder=4)[0]
+            self.ray_artists.append(line_artist)
             
             # Add arrow at the end to show direction
             dx = end[0] - start[0]
@@ -719,25 +735,30 @@ class FusionServer:
                 arrow_end_x = end[0] - dx_norm * arrow_length
                 arrow_end_y = end[1] - dy_norm * arrow_length
                 
-                self.ax.annotate('', xy=(end[0], end[1]), 
+                arrow_artist = self.ax.annotate('', xy=(end[0], end[1]), 
                                xytext=(arrow_end_x, arrow_end_y),
                                arrowprops=dict(arrowstyle='->', color=color, 
                                              alpha=alpha, lw=2),
                                zorder=5)
+                self.ray_artists.append(arrow_artist)
             
             # Add detection info text near the camera
             info_x = start[0] + 0.3
             info_y = start[1] + 0.3
-            self.ax.text(info_x, info_y, 
+            text_artist = self.ax.text(info_x, info_y, 
                         f'{cam_id}: ({ray_data["cx"]:.0f},{ray_data["cy"]:.0f})',
                         fontsize=8, color=color, alpha=alpha,
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
                                 alpha=0.7), zorder=6)
+            self.ray_artists.append(text_artist)
     
     def redraw_cameras(self):
         """Redraw all camera positions and FOVs when cameras are added/updated."""
         # Instead of trying to remove individual artists (which can fail),
         # we'll clear the entire plot and redraw everything
+        
+        # Clear any existing ray artists since we're doing a full redraw
+        self.ray_artists.clear()
         
         # Save current axis limits
         xlim = self.ax.get_xlim()
@@ -749,31 +770,44 @@ class FusionServer:
         # Restore plot settings
         self.ax.set_xlabel('X (meters)')
         self.ax.set_ylabel('Y (meters)')
-        self.ax.set_title('Multi-Camera Object Triangulation with AprilTags')
+        self.ax.set_title('Multi-Camera Object Triangulation')
         self.ax.grid(True)
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
         
-        # Redraw AprilTags first (so they appear behind cameras)
-        self.draw_apriltags()
+        # Only redraw AprilTags if they exist
+        if self.apriltags:
+            self.draw_apriltags()
         
         # Recreate the scatter plot for object positions
         self.scatter = self.ax.scatter([], [], c='blue', s=100, alpha=1.0, zorder=5, edgecolors='black', linewidth=1)
         
-        # Redraw all active cameras
+        # Draw ALL known cameras (both active and inactive) with different styles
         active_cameras = self.get_active_cameras()
         active_count = 0
+        inactive_count = 0
         
         for cam_id, pose in self.poses.items():
             if cam_id in active_cameras:
-                self.ax.plot(pose['x'], pose['y'], 'rs', markersize=12, label=f'Cam {cam_id}', zorder=10)
+                # Active camera - solid red square
+                self.ax.plot(pose['x'], pose['y'], 'rs', markersize=12, 
+                           label=f'Cam {cam_id} (Active)', zorder=10,
+                           markeredgecolor='black', markeredgewidth=1)
                 self.draw_camera_fov(pose, cam_id)
                 active_count += 1
+            else:
+                # Inactive camera - gray hollow square
+                self.ax.plot(pose['x'], pose['y'], 's', markersize=12, 
+                           color='lightgray', markeredgecolor='gray', markeredgewidth=2,
+                           label=f'Cam {cam_id} (Inactive)', zorder=10,
+                           fillstyle='none')
+                inactive_count += 1
         
         # Update legend
         self.ax.legend()
         
-        print(f"Redrawn plot with {active_count} active cameras (out of {len(self.poses)} total) and {len(self.apriltags)} AprilTags")
+        apriltag_info = f" and {len(self.apriltags)} AprilTags" if self.apriltags else ""
+        print(f"Redrawn plot with {active_count} active + {inactive_count} inactive cameras{apriltag_info}")
     
     async def run_server(self):
         """Main server loop receiving UDP packets and processing detections."""
